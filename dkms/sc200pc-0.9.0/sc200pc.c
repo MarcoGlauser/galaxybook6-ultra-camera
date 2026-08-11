@@ -1,0 +1,1328 @@
+// SPDX-License-Identifier: GPL-2.0
+//
+// V4L2 sensor driver for the Samsung/SmartSens SC200PC camera, exposed as
+// ACPI SSLC2000 on Panther Lake laptops.
+//
+// This variant targets the Samsung Galaxy Book6 Ultra (PAMC, SKU
+// PAMC-960UJH-PTLH-0), where it is the version that has been tested.
+//
+// Derived from the driver James Abbott wrote for the Galaxy Book6 Pro:
+// https://github.com/Jabbslad/sc200pc-linux
+//
+// The init table below is positionally identical to the mode table in the OEM
+// Windows driver sc200pc.sys v71.26100.0.11, verified entry by entry against
+// that binary.
+//
+// Also verified against it, on Galaxy Book6 Ultra hardware:
+//   - link frequency 416 MHz DDR, i.e. 832 Mbps/lane over 2 lanes. IPU7 ISYS
+//     programs D-PHY timing from V4L2_CID_LINK_FREQ, so a wrong value here
+//     probes and starts streaming but never delivers a frame.
+//   - analogue gain is a 16-bit composite split across 0x3e08 and 0x3e09,
+//     clamped to [0x10, 0x71f]: four octaves each spanning 1.0x to 1.9375x,
+//     for a 15.5x ceiling. The factory characterisation data lists the same
+//     four segments.
+//   - digital gain uses the fine register 0x3e07 only. The OEM driver never
+//     writes the coarse register 0x3e06, in its init table or at runtime.
+//   - black level is 64 at 10 bits, flat across gain.
+
+#include <linux/acpi.h>
+#include <linux/clk.h>
+#include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/i2c.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/pm_runtime.h>
+#include <linux/property.h>
+#include <linux/regulator/consumer.h>
+#include <media/v4l2-ctrls.h>
+#include <media/v4l2-device.h>
+#include <media/v4l2-fwnode.h>
+#include <media/v4l2-subdev.h>
+
+#define SC200PC_DRV_NAME "sc200pc"
+
+/* Register addresses (SmartSens SC20x family, verified against SC202CS). */
+#define SC200PC_REG_SLEEP_MODE		0x0100
+#define SC200PC_REG_SOFT_RESET		0x0103
+#define SC200PC_REG_CHIP_ID_H		0x3107
+#define SC200PC_REG_CHIP_ID_L		0x3108
+#define SC200PC_REG_CHIP_REVISION	0x3109
+#define SC200PC_REG_FLIP_MIRROR		0x3221
+#define SC200PC_REG_DIGITAL_GAIN_H	0x3e06
+#define SC200PC_REG_DIGITAL_GAIN_L	0x3e07
+#define SC200PC_REG_EXPOSURE_H		0x3e00
+#define SC200PC_REG_EXPOSURE_M		0x3e01
+#define SC200PC_REG_EXPOSURE_L		0x3e02
+#define SC200PC_REG_ANALOGUE_GAIN_COARSE	0x3e08
+#define SC200PC_REG_ANALOGUE_GAIN_FINE	0x3e09
+#define SC200PC_REG_BLACK_LEVEL		0x3901
+
+/*
+ * Sensor returns (0x0b << 8) | 0x71 on reg reads of 0x3107/0x3108.
+ * Silicon revision byte at 0x3109 reads 0x01 on this sample.
+ */
+#define SC200PC_CHIP_ID			0x0b71
+
+/*
+ * MIPI CSI-2 link frequency (Hz, DDR) = half of 832 Mbps/lane. IPU7 ISYS
+ * programs D-PHY timing from V4L2_CID_LINK_FREQ, so a wrong value here still
+ * probes and starts streaming but delivers no frames at all.
+ *
+ * 832 Mbps/lane is the rate the OEM Windows driver reports: sc200pc.sys
+ * v71.26100.0.11 holds it as a single hardcoded 832000000 constant. Two lanes
+ * comes from its mode table, which agrees with the init table's 0x330e = 0x28.
+ *
+ * That figure is the only one consistent with the timing: a 1928 px line at
+ * 10 bpp over 2 lanes within the init table's 14.75 us line time needs at
+ * least 654 Mbps/lane, which rules out the 390 Mbps/lane the pixel clock
+ * alone would imply.
+ */
+#define SC200PC_LINK_FREQ_DEFAULT	416000000ULL
+
+/* Native output resolution programmed by the init table. */
+#define SC200PC_WIDTH			1928
+#define SC200PC_HEIGHT			1088
+#define SC200PC_FPS			30
+#define SC200PC_HTS			0x047e	/* 1150 internal clocks/line */
+#define SC200PC_VTS_DEF			0x08d4	/* 2260 lines/frame */
+#define SC200PC_VTS_MIN			(SC200PC_HEIGHT + 8)
+#define SC200PC_VTS_MAX			0x7fff
+
+/*
+ * The SC200PC uses internal column-parallel readout: multiple pixels are
+ * sampled per internal clock cycle, so HTS (1150) < active width (1928).
+ * V4L2's timing model requires line_length_pixels >= active_width, and
+ * computes: llp = HBLANK + width, fll = VBLANK + height.
+ *
+ * We report pixel_rate at 2× the internal rate and treat line_length as
+ * 2×HTS.  This keeps frame-duration arithmetic exact:
+ *   llp = 2*1150 = 2300,  HBLANK = 2300 − 1928 = 372
+ *   fll = 2260,           VBLANK = 2260 − 1088 = 1172
+ *   pixel_rate = 2300 × 2260 × 30 = 155 940 000
+ *   frame_dur  = 2300 × 2260 / 155940000 = 33.33 ms  (30 fps)  ✓
+ *
+ * Exposure and gain units are unaffected — they are in lines and codes,
+ * not pixels.
+ */
+#define SC200PC_INTERNAL_PARALLELISM	2
+#define SC200PC_LLP			(SC200PC_HTS * SC200PC_INTERNAL_PARALLELISM)
+#define SC200PC_HBLANK_DEF		(SC200PC_LLP - SC200PC_WIDTH)
+#define SC200PC_VBLANK_DEF		(SC200PC_VTS_DEF - SC200PC_HEIGHT)
+#define SC200PC_PIXEL_RATE_DEFAULT	((u64)SC200PC_LLP * SC200PC_VTS_DEF * SC200PC_FPS)
+
+#define SC200PC_EXPOSURE_MIN		1
+#define SC200PC_EXPOSURE_MAX_MARGIN	8
+#define SC200PC_EXPOSURE_MAX		(SC200PC_VTS_DEF - SC200PC_EXPOSURE_MAX_MARGIN)
+#define SC200PC_EXPOSURE_DEFAULT	0x08b0
+#define SC200PC_ANALOGUE_GAIN_MIN	0x10
+#define SC200PC_ANALOGUE_GAIN_MAX	0xf8	/* 15.5x = octave 8.0x x fine 1.94x */
+/*
+ * The driver advertises V4L2_CID_ANALOGUE_GAIN as a total gain request,
+ * not as pure hardware analogue gain. Requests are filled from the analogue
+ * stage first; whatever its encoding cannot reach spills into the
+ * digital-gain registers. This keeps libcamera's simple AGC working at
+ * 30 fps without needing userspace changes to explicitly drive digital gain.
+ *
+ * Control scale matches the existing SC200PC helper model: gain code / 16.
+ *   0x10  = 1.0x total gain   -> analogue 1.0x,  digital 1.0x
+ *   0xf8  = 15.5x total gain  -> analogue 15.5x, digital 1.0x
+ *   0x1e8 = 30.5x total gain  -> analogue 15.5x, digital 1.97x
+ */
+#define SC200PC_TOTAL_GAIN_MAX		0x1e8	/* 30.5x total via analogue+digital */
+#define SC200PC_ANALOGUE_GAIN_DEFAULT	0x10
+
+/*
+ * Digital gain follows the SmartSens SC20x scale where 128 = 1.0x, carried
+ * entirely in the fine register 0x3e07.
+ *
+ * This control remains exposed separately for diagnostics and manual
+ * experiments, but normal auto-exposure flow uses sc200pc_set_total_gain()
+ * via the advertised analogue-gain control above.
+ */
+#define SC200PC_DIGITAL_GAIN_MIN	128
+#define SC200PC_DIGITAL_GAIN_MAX	252	/* 0xfc = ~1.97x, fine register only */
+#define SC200PC_DIGITAL_GAIN_DEFAULT	128
+
+/* VTS register pair (big-endian 16-bit). */
+#define SC200PC_REG_VTS_H		0x320e
+#define SC200PC_REG_VTS_L		0x320f
+
+/* Init table terminators. */
+#define SC200PC_REG_END			0xffff
+#define SC200PC_REG_DELAY		0xfffe
+
+struct sc200pc_reg {
+	u16 addr;
+	u8  val;
+};
+
+/*
+ * 1928x1088 RAW10 Bayer BGGR, 30 fps, 2-lane MIPI CSI-2.
+ *
+ * Extracted verbatim from the OEM Windows driver (sc200pc.sys,
+ * version 71.26100.0.11, Microsoft Update Catalog package for
+ * hardware ID ACPI\SSLC2000). The .sys stores init tables as an array
+ * of {u32 op, u32 addr, u32 value, u32 reserved} entries in .rdata;
+ * this is the 141-entry main streaming table. See comments in
+ * camera-bringup-plan.md for the extraction method.
+ *
+ *   output size (active):    1920 x 1080
+ *   output size (with blank):1928 x 1088
+ *   HTS = 0x047e = 1150
+ *   VTS = 0x08d4 = 2260
+ *   lane count via 0x330e:   upper nibble 2 = 2 lanes
+ *   exposure (0x3e00-0x3e02): 0x0008b0 = 2224 lines
+ */
+static const struct sc200pc_reg sc200pc_1928x1088_raw10_30fps[] = {
+	{ 0x0103, 0x01 },		/* software reset */
+	{ 0x301f, 0x29 },
+	{ 0x3200, 0x00 },
+	{ 0x3201, 0x00 },
+	{ 0x3202, 0x00 },
+	{ 0x3203, 0x00 },
+	{ 0x3204, 0x07 },
+	{ 0x3205, 0x8f },
+	{ 0x3206, 0x04 },
+	{ 0x3207, 0x47 },
+	{ 0x3208, 0x07 },		/* output_width high = 0x0788 */
+	{ 0x3209, 0x88 },		/* output_width low             */
+	{ 0x320a, 0x04 },		/* output_height high = 0x0440  */
+	{ 0x320b, 0x40 },		/* output_height low            */
+	{ 0x320c, 0x04 },		/* HTS high = 0x047e            */
+	{ 0x320d, 0x7e },		/* HTS low                      */
+	{ 0x320e, 0x08 },		/* VTS high = 0x08d4            */
+	{ 0x320f, 0xd4 },		/* VTS low                      */
+	{ 0x3210, 0x00 },
+	{ 0x3211, 0x04 },
+	{ 0x3212, 0x00 },
+	{ 0x3213, 0x04 },
+	{ 0x3250, 0xff },
+	{ 0x3253, 0x60 },
+	{ 0x325f, 0x80 },
+	{ 0x327f, 0x3f },
+	{ 0x3281, 0x01 },
+	{ 0x32d1, 0x70 },
+	{ 0x3301, 0x07 },
+	{ 0x3302, 0x18 },
+	{ 0x3306, 0x30 },
+	{ 0x3308, 0x10 },
+	{ 0x330b, 0x78 },
+	{ 0x330e, 0x28 },		/* MIPI lane cfg: 2 lanes (upper) */
+	{ 0x330f, 0x01 },
+	{ 0x3310, 0x01 },
+	{ 0x331e, 0x21 },
+	{ 0x331f, 0x21 },
+	{ 0x3333, 0x10 },
+	{ 0x3334, 0x40 },
+	{ 0x3347, 0x05 },
+	{ 0x334c, 0x08 },
+	{ 0x335d, 0x60 },
+	{ 0x3364, 0x56 },
+	{ 0x3390, 0x08 },
+	{ 0x3391, 0x38 },
+	{ 0x3393, 0x0e },
+	{ 0x3394, 0x10 },
+	{ 0x33ad, 0x1c },
+	{ 0x33b0, 0x0f },
+	{ 0x33b1, 0x80 },
+	{ 0x33b2, 0x58 },
+	{ 0x33b3, 0x08 },
+	{ 0x349f, 0x02 },
+	{ 0x34a6, 0x18 },
+	{ 0x34a7, 0x38 },
+	{ 0x34a8, 0x07 },
+	{ 0x34a9, 0x06 },
+	{ 0x3619, 0x20 },		/* PLL / analog frontend         */
+	{ 0x361a, 0x91 },
+	{ 0x3633, 0x48 },
+	{ 0x3637, 0x49 },
+	{ 0x3638, 0xa1 },
+	{ 0x3660, 0x80 },
+	{ 0x3661, 0x86 },
+	{ 0x3662, 0x8e },
+	{ 0x3667, 0x38 },
+	{ 0x3668, 0x78 },
+	{ 0x3670, 0x65 },
+	{ 0x3671, 0x45 },
+	{ 0x3672, 0x45 },
+	{ 0x3680, 0x46 },
+	{ 0x3681, 0x66 },
+	{ 0x3682, 0x88 },
+	{ 0x3683, 0x29 },
+	{ 0x3684, 0x39 },
+	{ 0x3685, 0x39 },
+	{ 0x36c0, 0x08 },
+	{ 0x36c1, 0x18 },
+	{ 0x36c8, 0x18 },
+	{ 0x36c9, 0x78 },
+	{ 0x36ca, 0x08 },
+	{ 0x36cb, 0x78 },
+	{ 0x3718, 0x04 },
+	{ 0x3723, 0x20 },
+	{ 0x3724, 0xe1 },
+	{ 0x3770, 0x03 },
+	{ 0x3771, 0x03 },
+	{ 0x3772, 0x03 },
+	{ 0x37c0, 0x08 },
+	{ 0x37c1, 0x78 },
+	{ 0x37ea, 0x10 },
+	{ 0x37ed, 0x89 },
+	{ 0x37f9, 0x00 },
+	{ 0x37fa, 0x0c },
+	{ 0x37fb, 0xca },
+	{ 0x3901, 0x08 },
+	{ 0x3902, 0xc0 },
+	{ 0x3903, 0x40 },
+	{ 0x3908, 0x40 },
+	{ 0x3909, 0x01 },
+	{ 0x390a, 0x81 },
+	{ 0x3929, 0x18 },
+	{ 0x3933, 0x80 },
+	{ 0x3934, 0x01 },
+	{ 0x3937, 0x80 },
+	{ 0x3939, 0x0f },
+	{ 0x393a, 0xfe },
+	{ 0x393d, 0x01 },
+	{ 0x393e, 0xff },
+	{ 0x39dd, 0x06 },
+	{ 0x3c0f, 0x02 },
+	{ 0x3e00, 0x00 },		/* exposure high                 */
+	{ 0x3e01, 0x08 },		/* exposure mid                  */
+	{ 0x3e02, 0xb0 },		/* exposure low = 0x0008b0       */
+	{ 0x3e03, 0x0b },
+	{ 0x3e04, 0x10 },
+	{ 0x3e05, 0x70 },
+	{ 0x3e09, 0x10 },		/* analog gain                   */
+	{ 0x3e23, 0x00 },
+	{ 0x3e24, 0x86 },
+	{ 0x3f09, 0x0e },
+	{ 0x4407, 0x0c },
+	{ 0x4509, 0x1e },		/* MIPI tuning                   */
+	{ 0x450d, 0x01 },
+	{ 0x450f, 0x06 },
+	{ 0x4820, 0x00 },
+	{ 0x4821, 0xb2 },
+	{ 0x482e, 0x34 },
+	{ 0x4837, 0x13 },
+	{ 0x5000, 0x06 },
+	{ 0x5002, 0x06 },
+	{ 0x5784, 0x0c },
+	{ 0x5785, 0x04 },
+	{ 0x578d, 0x40 },
+	{ 0x57ac, 0x00 },
+	{ 0x57ad, 0x00 },
+	{ 0x58e0, 0xae },
+	{ 0x3802, 0x01 },
+	{ 0x3021, 0x67 },
+	{ SC200PC_REG_SLEEP_MODE, 0x00 }, /* stay in sleep until s_stream */
+	{ SC200PC_REG_END, 0x00 },
+};
+
+struct sc200pc {
+	struct device *dev;
+	struct i2c_client *client;
+	struct v4l2_subdev sd;
+	struct media_pad pad;
+	struct v4l2_mbus_framefmt fmt;
+	struct mutex lock;
+
+	struct regulator *avdd;
+	struct regulator *dvdd;
+	struct regulator *dovdd;
+	struct clk *xclk;
+
+	/* Names come directly from Windows sc200pc.sys strings. */
+	struct gpio_desc *reset_gpio;
+	struct gpio_desc *power0_gpio;
+	struct gpio_desc *power1_gpio;
+
+	struct v4l2_ctrl_handler ctrls;
+	struct v4l2_ctrl *link_freq;
+	struct v4l2_ctrl *pixel_rate;
+	struct v4l2_ctrl *vblank;
+	struct v4l2_ctrl *hblank;
+	struct v4l2_ctrl *exposure;
+	struct v4l2_ctrl *analogue_gain;
+	struct v4l2_ctrl *digital_gain;
+	struct v4l2_ctrl *test_pattern;
+
+	u16  cur_vts;
+	bool streaming;
+	u32 xclk_freq;
+	u32 mipi_lanes;
+	u32 mipi_port;
+	u32 mipi_mbps;
+	u16 chip_id;
+	u8  chip_rev;
+};
+
+static const s64 sc200pc_link_freqs[] = {
+	SC200PC_LINK_FREQ_DEFAULT,
+};
+
+static const char * const sc200pc_test_pattern_menu[] = {
+	"Off",
+	"Color Bars",
+};
+
+static const struct v4l2_rect sc200pc_pixel_array = {
+	.left = 0,
+	.top = 0,
+	.width = SC200PC_WIDTH,
+	.height = SC200PC_HEIGHT,
+};
+
+static inline struct sc200pc *to_sc200pc(struct v4l2_subdev *sd)
+{
+	return container_of(sd, struct sc200pc, sd);
+}
+
+static inline struct sc200pc *ctrl_to_sc200pc(struct v4l2_ctrl *ctrl)
+{
+	return container_of(ctrl->handler, struct sc200pc, ctrls);
+}
+
+static int sc200pc_read_reg(struct sc200pc *sensor, u16 reg, u8 *val)
+{
+	struct i2c_client *client = sensor->client;
+	struct i2c_msg msgs[2];
+	u8 addr[2] = { reg >> 8, reg & 0xff };
+	int ret;
+
+	msgs[0].addr = client->addr;
+	msgs[0].flags = 0;
+	msgs[0].len = sizeof(addr);
+	msgs[0].buf = addr;
+
+	msgs[1].addr = client->addr;
+	msgs[1].flags = I2C_M_RD;
+	msgs[1].len = 1;
+	msgs[1].buf = val;
+
+	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+	if (ret < 0)
+		return ret;
+	if (ret != ARRAY_SIZE(msgs))
+		return -EIO;
+
+	return 0;
+}
+
+static int sc200pc_write_reg(struct sc200pc *sensor, u16 reg, u8 val)
+{
+	struct i2c_client *client = sensor->client;
+	u8 buf[3] = { reg >> 8, reg & 0xff, val };
+	int ret;
+
+	ret = i2c_master_send(client, buf, sizeof(buf));
+	if (ret < 0)
+		return ret;
+	if (ret != sizeof(buf))
+		return -EIO;
+
+	return 0;
+}
+
+static int sc200pc_write_array(struct sc200pc *sensor,
+			       const struct sc200pc_reg *regs)
+{
+	int ret;
+
+	for (; regs->addr != SC200PC_REG_END; regs++) {
+		if (regs->addr == SC200PC_REG_DELAY) {
+			msleep(regs->val);
+			continue;
+		}
+
+		ret = sc200pc_write_reg(sensor, regs->addr, regs->val);
+		if (ret) {
+			dev_err(sensor->dev,
+				"failed write reg 0x%04x = 0x%02x: %d\n",
+				regs->addr, regs->val, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static u32 sc200pc_exposure_max(const struct sc200pc *sensor)
+{
+	return max_t(u32, SC200PC_EXPOSURE_MIN,
+		     sensor->cur_vts - SC200PC_EXPOSURE_MAX_MARGIN);
+}
+
+static void sc200pc_update_exposure_range(struct sc200pc *sensor)
+{
+	u32 max_exp = sc200pc_exposure_max(sensor);
+	u32 def_exp = min_t(u32, SC200PC_EXPOSURE_DEFAULT, max_exp);
+
+	__v4l2_ctrl_modify_range(sensor->exposure,
+				 SC200PC_EXPOSURE_MIN, max_exp, 1, def_exp);
+}
+
+static void sc200pc_log_key_regs(struct sc200pc *sensor, const char *tag)
+{
+	static const struct {
+		u16 reg;
+		const char *name;
+	} regs[] = {
+		{ SC200PC_REG_FLIP_MIRROR, "3221" },
+		{ SC200PC_REG_DIGITAL_GAIN_H, "3e06" },
+		{ SC200PC_REG_DIGITAL_GAIN_L, "3e07" },
+		{ SC200PC_REG_ANALOGUE_GAIN_COARSE, "3e08" },
+		{ SC200PC_REG_ANALOGUE_GAIN_FINE, "3e09" },
+		{ SC200PC_REG_BLACK_LEVEL, "3901" },
+		{ SC200PC_REG_VTS_H, "320e" },
+		{ SC200PC_REG_VTS_L, "320f" },
+	};
+	char buf[160];
+	int i, len = 0;
+
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		u8 val;
+		int ret = sc200pc_read_reg(sensor, regs[i].reg, &val);
+
+		if (ret)
+			len += scnprintf(buf + len, sizeof(buf) - len,
+					 "%s=<err:%d> ", regs[i].name, ret);
+		else
+			len += scnprintf(buf + len, sizeof(buf) - len,
+					 "%s=0x%02x ", regs[i].name, val);
+	}
+
+	dev_info(sensor->dev, "%s: %s\n", tag, buf);
+}
+
+static int sc200pc_set_exposure(struct sc200pc *sensor, u32 exposure)
+{
+	int ret;
+
+	/*
+	 * SmartSens SC20x-family sensors encode coarse integration time as a
+	 * 12.4 fixed-point value across 0x3e00..0x3e02.
+	 */
+	exposure = clamp_t(u32, exposure,
+			   SC200PC_EXPOSURE_MIN, sc200pc_exposure_max(sensor));
+
+	ret = sc200pc_write_reg(sensor, SC200PC_REG_EXPOSURE_H,
+			       (exposure >> 12) & 0x0f);
+	if (ret)
+		return ret;
+
+	ret = sc200pc_write_reg(sensor, SC200PC_REG_EXPOSURE_M,
+			       (exposure >> 4) & 0xff);
+	if (ret)
+		return ret;
+
+	return sc200pc_write_reg(sensor, SC200PC_REG_EXPOSURE_L,
+				 (exposure & 0x0f) << 4);
+}
+
+/*
+ * Analogue gain is a coarse octave times a fine step, not a linear code:
+ *   0x3e08 octave, thermometer-coded: 0x00/0x01/0x03/0x07 = 1/2/4/8x
+ *   0x3e09 fine step: 0x10-0x1f = 16/16 to 31/16, i.e. 1.0x to 1.94x
+ *
+ * The OEM Windows driver treats the pair as one big-endian 16-bit code: it
+ * either writes two bytes starting at 0x3e08, or splits code >> 8 and
+ * code & 0xff across the two registers, and clamps the result to
+ * [0x10, 0x71f]. That ceiling is (0x07 << 8) | 0x1f exactly, which is what
+ * fixes the octave at 8x and the fine step at 1.94x for a 15.5x maximum.
+ *
+ * A linear code written into 0x3e09 alone therefore addresses only the fine
+ * field and collapses every request back to ~1x.
+ *
+ * Returns the gain this encoding actually lands on, in the control's
+ * code / 16 scale, so the caller can size the digital remainder.
+ */
+static u32 sc200pc_encode_analogue_gain(u32 gain, u8 *octave, u8 *fine)
+{
+	static const u8 octave_map[] = { 0x00, 0x01, 0x03, 0x07 };
+	unsigned int idx = 0;
+	u32 factor = 1;
+	u32 step;
+
+	gain = clamp_t(u32, gain,
+		       SC200PC_ANALOGUE_GAIN_MIN, SC200PC_ANALOGUE_GAIN_MAX);
+
+	while (idx + 1 < ARRAY_SIZE(octave_map) &&
+	       gain >= factor * 2 * SC200PC_ANALOGUE_GAIN_MIN) {
+		factor <<= 1;
+		idx++;
+	}
+
+	step = clamp_t(u32, gain / factor, 0x10, 0x1f);
+
+	*octave = octave_map[idx];
+	*fine = step;
+
+	return factor * step;
+}
+
+static int sc200pc_set_analogue_gain(struct sc200pc *sensor, u8 octave, u8 fine)
+{
+	int ret;
+
+	ret = sc200pc_write_reg(sensor, SC200PC_REG_ANALOGUE_GAIN_COARSE,
+				octave);
+	if (ret)
+		return ret;
+
+	return sc200pc_write_reg(sensor, SC200PC_REG_ANALOGUE_GAIN_FINE, fine);
+}
+
+/*
+ * Digital gain uses the fine register only: 0x3e07, 0x80 = 1.0x up to
+ * 0xfc = ~1.97x, written in 4-step increments because the SmartSens family
+ * ignores the low two bits.
+ *
+ * The coarse register 0x3e06 is deliberately left at its reset value. The OEM
+ * Windows driver never writes it -- not in its init table, and not from any
+ * runtime path -- so its behaviour on this part is unexercised by the vendor
+ * and best not relied on.
+ */
+static int sc200pc_set_digital_gain(struct sc200pc *sensor, u32 gain)
+{
+	u32 fine;
+
+	gain = clamp_t(u32, gain,
+		       SC200PC_DIGITAL_GAIN_MIN, SC200PC_DIGITAL_GAIN_MAX);
+
+	fine = DIV_ROUND_CLOSEST(gain, 4) * 4;
+
+	return sc200pc_write_reg(sensor, SC200PC_REG_DIGITAL_GAIN_L, fine);
+}
+
+/*
+ * Program a total gain request by splitting it across the sensor's analogue
+ * and digital gain stages, analogue first.
+ *
+ * Userspace sees a single monotonic V4L2_CID_ANALOGUE_GAIN control on the
+ * code / 16 scale. Digital gain uses the family's 128 = 1.0x scale, hence
+ * the rescale when sizing the remainder the analogue encoding left over.
+ */
+static int sc200pc_set_total_gain(struct sc200pc *sensor, u32 gain)
+{
+	u32 analogue_applied;
+	u32 digital_gain;
+	u8 octave;
+	u8 fine;
+	int ret;
+
+	gain = clamp_t(u32, gain,
+		       SC200PC_ANALOGUE_GAIN_MIN, SC200PC_TOTAL_GAIN_MAX);
+
+	analogue_applied = sc200pc_encode_analogue_gain(gain, &octave, &fine);
+
+	digital_gain = DIV_ROUND_CLOSEST(gain * SC200PC_DIGITAL_GAIN_MIN,
+					 analogue_applied);
+	digital_gain = clamp_t(u32, digital_gain,
+			       SC200PC_DIGITAL_GAIN_MIN,
+			       SC200PC_DIGITAL_GAIN_MAX);
+
+	ret = sc200pc_set_digital_gain(sensor, digital_gain);
+	if (ret)
+		return ret;
+
+	return sc200pc_set_analogue_gain(sensor, octave, fine);
+}
+
+static int sc200pc_apply_controls(struct sc200pc *sensor)
+{
+	int ret;
+
+	ret = sc200pc_set_exposure(sensor, sensor->exposure->val);
+	if (ret)
+		return ret;
+
+	return sc200pc_set_total_gain(sensor, sensor->analogue_gain->val);
+}
+
+static int sc200pc_set_vts(struct sc200pc *sensor, u16 vts)
+{
+	int ret;
+
+	ret = sc200pc_write_reg(sensor, SC200PC_REG_VTS_H, vts >> 8);
+	if (ret)
+		return ret;
+
+	ret = sc200pc_write_reg(sensor, SC200PC_REG_VTS_L, vts & 0xff);
+	if (ret)
+		return ret;
+
+	sensor->cur_vts = vts;
+	return 0;
+}
+
+static int sc200pc_s_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct sc200pc *sensor = ctrl_to_sc200pc(ctrl);
+	int ret = 0;
+
+	mutex_lock(&sensor->lock);
+
+	/*
+	 * VBLANK / HBLANK are cached even while not streaming so that
+	 * the HAL can read back the value it wrote before stream-on.
+	 */
+	switch (ctrl->id) {
+	case V4L2_CID_VBLANK: {
+		u16 vts = ctrl->val + SC200PC_HEIGHT;
+
+		if (sensor->streaming) {
+			ret = sc200pc_set_vts(sensor, vts);
+		} else {
+			sensor->cur_vts = vts;
+		}
+		if (!ret)
+			sc200pc_update_exposure_range(sensor);
+		break;
+	}
+	case V4L2_CID_HBLANK:
+		/* Accept the write; HTS is fixed by the init table. */
+		ret = 0;
+		break;
+	default:
+		break;
+	}
+
+	if (!sensor->streaming)
+		goto out_unlock;
+
+	switch (ctrl->id) {
+	case V4L2_CID_EXPOSURE:
+		ret = sc200pc_set_exposure(sensor, ctrl->val);
+		break;
+	case V4L2_CID_ANALOGUE_GAIN:
+		ret = sc200pc_set_total_gain(sensor, ctrl->val);
+		break;
+	case V4L2_CID_DIGITAL_GAIN:
+		ret = sc200pc_set_digital_gain(sensor, ctrl->val);
+		if (!ret)
+			sc200pc_log_key_regs(sensor, "digital-gain update");
+		break;
+	case V4L2_CID_TEST_PATTERN:
+		/*
+		 * The HAL always sends TEST_PATTERN=Off during startup.
+		 * Accept that request even though test-pattern programming
+		 * is not wired yet, so the sensor can be configured.
+		 */
+		ret = 0;
+		break;
+	default:
+		break;
+	}
+
+out_unlock:
+	mutex_unlock(&sensor->lock);
+	return ret;
+}
+
+static const struct v4l2_ctrl_ops sc200pc_ctrl_ops = {
+	.s_ctrl = sc200pc_s_ctrl,
+};
+
+static int sc200pc_power_on(struct sc200pc *sensor)
+{
+	int ret;
+
+	if (!IS_ERR(sensor->avdd)) {
+		ret = regulator_enable(sensor->avdd);
+		if (ret)
+			return ret;
+	}
+
+	if (!IS_ERR(sensor->dvdd)) {
+		ret = regulator_enable(sensor->dvdd);
+		if (ret)
+			goto err_disable_avdd;
+	}
+
+	if (!IS_ERR(sensor->dovdd)) {
+		ret = regulator_enable(sensor->dovdd);
+		if (ret)
+			goto err_disable_dvdd;
+	}
+
+	if (!IS_ERR(sensor->xclk)) {
+		ret = clk_prepare_enable(sensor->xclk);
+		if (ret)
+			goto err_disable_dovdd;
+	}
+
+	if (!IS_ERR(sensor->power0_gpio))
+		gpiod_set_value_cansleep(sensor->power0_gpio, 1);
+	if (!IS_ERR(sensor->power1_gpio))
+		gpiod_set_value_cansleep(sensor->power1_gpio, 1);
+
+	usleep_range(2000, 4000);
+
+	if (!IS_ERR(sensor->reset_gpio)) {
+		gpiod_set_value_cansleep(sensor->reset_gpio, 1);
+		usleep_range(2000, 4000);
+		gpiod_set_value_cansleep(sensor->reset_gpio, 0);
+	}
+
+	usleep_range(5000, 10000);
+	return 0;
+
+err_disable_dovdd:
+	if (!IS_ERR(sensor->dovdd))
+		regulator_disable(sensor->dovdd);
+err_disable_dvdd:
+	if (!IS_ERR(sensor->dvdd))
+		regulator_disable(sensor->dvdd);
+err_disable_avdd:
+	if (!IS_ERR(sensor->avdd))
+		regulator_disable(sensor->avdd);
+	return ret;
+}
+
+static void sc200pc_power_off(struct sc200pc *sensor)
+{
+	if (!IS_ERR(sensor->reset_gpio))
+		gpiod_set_value_cansleep(sensor->reset_gpio, 1);
+	if (!IS_ERR(sensor->power1_gpio))
+		gpiod_set_value_cansleep(sensor->power1_gpio, 0);
+	if (!IS_ERR(sensor->power0_gpio))
+		gpiod_set_value_cansleep(sensor->power0_gpio, 0);
+
+	if (!IS_ERR(sensor->xclk))
+		clk_disable_unprepare(sensor->xclk);
+	if (!IS_ERR(sensor->dovdd))
+		regulator_disable(sensor->dovdd);
+	if (!IS_ERR(sensor->dvdd))
+		regulator_disable(sensor->dvdd);
+	if (!IS_ERR(sensor->avdd))
+		regulator_disable(sensor->avdd);
+}
+
+static int sc200pc_identify(struct sc200pc *sensor)
+{
+	u8 id_h = 0, id_l = 0, rev = 0;
+	u16 chip_id;
+	int ret;
+
+	ret = sc200pc_read_reg(sensor, SC200PC_REG_CHIP_ID_H, &id_h);
+	if (ret)
+		return dev_err_probe(sensor->dev, ret,
+				     "failed to read chip ID high byte\n");
+
+	ret = sc200pc_read_reg(sensor, SC200PC_REG_CHIP_ID_L, &id_l);
+	if (ret)
+		return dev_err_probe(sensor->dev, ret,
+				     "failed to read chip ID low byte\n");
+
+	ret = sc200pc_read_reg(sensor, SC200PC_REG_CHIP_REVISION, &rev);
+	if (ret)
+		dev_warn(sensor->dev, "failed to read chip revision: %d\n", ret);
+
+	chip_id = ((u16)id_h << 8) | id_l;
+	sensor->chip_id = chip_id;
+	sensor->chip_rev = rev;
+
+	if (chip_id != SC200PC_CHIP_ID)
+		return dev_err_probe(sensor->dev, -ENODEV,
+				     "unexpected chip ID 0x%04x, expected 0x%04x\n",
+				     chip_id, SC200PC_CHIP_ID);
+
+	dev_info(sensor->dev, "detected SC200PC (chip ID 0x%04x, rev 0x%02x)\n",
+		 chip_id, rev);
+	return 0;
+}
+
+static int sc200pc_start_streaming(struct sc200pc *sensor)
+{
+	int ret;
+
+	dev_info(sensor->dev, "writing init table (%zu entries)...\n",
+		 ARRAY_SIZE(sc200pc_1928x1088_raw10_30fps) - 1);
+
+	ret = sc200pc_write_array(sensor, sc200pc_1928x1088_raw10_30fps);
+	if (ret)
+		return ret;
+
+	sc200pc_log_key_regs(sensor, "post-init regs");
+
+	/*
+	 * Apply VTS if the HAL changed VBLANK before stream-on.
+	 * The init table sets VTS to SC200PC_VTS_DEF; only re-write
+	 * if the cached value differs.
+	 */
+	if (sensor->cur_vts != SC200PC_VTS_DEF) {
+		ret = sc200pc_set_vts(sensor, sensor->cur_vts);
+		if (ret)
+			return ret;
+	}
+
+	/* Releasing sleep starts the MIPI output. */
+	ret = sc200pc_write_reg(sensor, SC200PC_REG_SLEEP_MODE, 0x01);
+	if (ret)
+		return ret;
+
+	ret = sc200pc_apply_controls(sensor);
+	if (ret)
+		return ret;
+
+	sc200pc_log_key_regs(sensor, "post-control regs");
+	dev_info(sensor->dev, "streaming started\n");
+	return 0;
+}
+
+static int sc200pc_stop_streaming(struct sc200pc *sensor)
+{
+	int ret;
+
+	ret = sc200pc_write_reg(sensor, SC200PC_REG_SLEEP_MODE, 0x00);
+	if (ret)
+		dev_warn(sensor->dev, "failed to clear stream enable: %d\n", ret);
+
+	dev_dbg(sensor->dev, "streaming stopped\n");
+	return ret;
+}
+
+static int sc200pc_s_stream(struct v4l2_subdev *sd, int enable)
+{
+	struct sc200pc *sensor = to_sc200pc(sd);
+	int ret = 0;
+
+	dev_info(sensor->dev, "s_stream(enable=%d) called\n", enable);
+
+	mutex_lock(&sensor->lock);
+
+	if (sensor->streaming == !!enable)
+		goto out_unlock;
+
+	if (enable) {
+		ret = sc200pc_power_on(sensor);
+		if (ret)
+			goto out_unlock;
+
+		ret = sc200pc_start_streaming(sensor);
+		if (ret) {
+			sc200pc_power_off(sensor);
+			goto out_unlock;
+		}
+
+		sensor->streaming = true;
+	} else {
+		sc200pc_stop_streaming(sensor);
+		sc200pc_power_off(sensor);
+		sensor->streaming = false;
+	}
+
+out_unlock:
+	mutex_unlock(&sensor->lock);
+	return ret;
+}
+
+static int sc200pc_enum_mbus_code(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *state,
+				  struct v4l2_subdev_mbus_code_enum *code)
+{
+	if (code->index)
+		return -EINVAL;
+
+	code->code = MEDIA_BUS_FMT_SBGGR10_1X10;
+	return 0;
+}
+
+static int sc200pc_enum_frame_size(struct v4l2_subdev *sd,
+				   struct v4l2_subdev_state *state,
+				   struct v4l2_subdev_frame_size_enum *fse)
+{
+	struct sc200pc *sensor = to_sc200pc(sd);
+
+	dev_info(sensor->dev, "enum_frame_size idx=%u code=0x%x\n",
+		 fse->index, fse->code);
+
+	if (fse->index)
+		return -EINVAL;
+
+	if (fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
+		return -EINVAL;
+
+	fse->min_width = SC200PC_WIDTH;
+	fse->max_width = SC200PC_WIDTH;
+	fse->min_height = SC200PC_HEIGHT;
+	fse->max_height = SC200PC_HEIGHT;
+
+	return 0;
+}
+
+static int sc200pc_enum_frame_interval(struct v4l2_subdev *sd,
+				       struct v4l2_subdev_state *state,
+				       struct v4l2_subdev_frame_interval_enum *fie)
+{
+	struct sc200pc *sensor = to_sc200pc(sd);
+
+	dev_info(sensor->dev,
+		 "enum_frame_interval idx=%u code=0x%x %ux%u\n",
+		 fie->index, fie->code, fie->width, fie->height);
+
+	if (fie->index)
+		return -EINVAL;
+
+	if (fie->code != MEDIA_BUS_FMT_SBGGR10_1X10 ||
+	    fie->width != SC200PC_WIDTH ||
+	    fie->height != SC200PC_HEIGHT)
+		return -EINVAL;
+
+	fie->interval.numerator = 1;
+	fie->interval.denominator = SC200PC_FPS;
+
+	return 0;
+}
+
+static int sc200pc_get_selection(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *state,
+				 struct v4l2_subdev_selection *sel)
+{
+	struct sc200pc *sensor = to_sc200pc(sd);
+
+	if (sel->pad != 0)
+		return -EINVAL;
+
+	dev_info(sensor->dev, "get_selection target=%u\n", sel->target);
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r = sc200pc_pixel_array;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int sc200pc_get_fmt(struct v4l2_subdev *sd,
+			   struct v4l2_subdev_state *state,
+			   struct v4l2_subdev_format *fmt)
+{
+	struct sc200pc *sensor = to_sc200pc(sd);
+
+	mutex_lock(&sensor->lock);
+	fmt->format = sensor->fmt;
+	mutex_unlock(&sensor->lock);
+
+	return 0;
+}
+
+static int sc200pc_set_fmt(struct v4l2_subdev *sd,
+			   struct v4l2_subdev_state *state,
+			   struct v4l2_subdev_format *fmt)
+{
+	struct sc200pc *sensor = to_sc200pc(sd);
+
+	mutex_lock(&sensor->lock);
+
+	sensor->fmt.width = SC200PC_WIDTH;
+	sensor->fmt.height = SC200PC_HEIGHT;
+	sensor->fmt.code = MEDIA_BUS_FMT_SBGGR10_1X10;
+	sensor->fmt.field = V4L2_FIELD_NONE;
+	sensor->fmt.colorspace = V4L2_COLORSPACE_RAW;
+
+	fmt->format = sensor->fmt;
+
+	mutex_unlock(&sensor->lock);
+	return 0;
+}
+
+static const struct v4l2_subdev_video_ops sc200pc_video_ops = {
+	.s_stream = sc200pc_s_stream,
+};
+
+static const struct v4l2_subdev_pad_ops sc200pc_pad_ops = {
+	.enum_mbus_code = sc200pc_enum_mbus_code,
+	.enum_frame_size = sc200pc_enum_frame_size,
+	.enum_frame_interval = sc200pc_enum_frame_interval,
+	.get_fmt = sc200pc_get_fmt,
+	.set_fmt = sc200pc_set_fmt,
+	.get_selection = sc200pc_get_selection,
+};
+
+static const struct v4l2_subdev_ops sc200pc_subdev_ops = {
+	.video = &sc200pc_video_ops,
+	.pad = &sc200pc_pad_ops,
+};
+
+static int sc200pc_parse_firmware(struct sc200pc *sensor)
+{
+	struct acpi_device *adev = ACPI_COMPANION(sensor->dev);
+	struct fwnode_handle *fwnode = dev_fwnode(sensor->dev);
+	struct fwnode_handle *ep;
+	struct v4l2_fwnode_endpoint vep = {
+		.bus_type = V4L2_MBUS_CSI2_DPHY,
+	};
+	int ret;
+
+	sensor->mipi_lanes = 2;
+	sensor->mipi_port = 0;
+	sensor->mipi_mbps = 0;
+
+	dev_info(sensor->dev,
+		 "fwnode=%p acpi=%d software=%d acpi-companion=%s hid=%s\n",
+		 fwnode,
+		 fwnode ? is_acpi_node(fwnode) : 0,
+		 fwnode ? is_software_node(fwnode) : 0,
+		 adev ? acpi_dev_name(adev) : "<none>",
+		 adev ? acpi_device_hid(adev) : "<none>");
+
+	ep = fwnode_graph_get_next_endpoint(dev_fwnode(sensor->dev), NULL);
+	if (!ep) {
+		dev_warn(sensor->dev,
+			 "no firmware endpoint on sensor device; graph integration likely incomplete\n");
+		return 0;
+	}
+
+	ret = v4l2_fwnode_endpoint_parse(ep, &vep);
+	if (ret) {
+		dev_warn(sensor->dev,
+			 "failed to parse firmware endpoint: %d\n", ret);
+		fwnode_handle_put(ep);
+		return 0;
+	}
+
+	if (vep.bus_type == V4L2_MBUS_CSI2_DPHY ||
+	    vep.bus_type == V4L2_MBUS_CSI2_CPHY)
+		sensor->mipi_lanes = vep.bus.mipi_csi2.num_data_lanes;
+
+	dev_info(sensor->dev,
+		 "firmware endpoint: bus_type=%u lanes=%u clock=%u port=%u\n",
+		 vep.bus_type, sensor->mipi_lanes, sensor->xclk_freq,
+		 sensor->mipi_port);
+
+	fwnode_handle_put(ep);
+	return 0;
+}
+
+static int sc200pc_probe(struct i2c_client *client)
+{
+	struct device *dev = &client->dev;
+	struct sc200pc *sensor;
+	int ret;
+
+	sensor = devm_kzalloc(dev, sizeof(*sensor), GFP_KERNEL);
+	if (!sensor)
+		return -ENOMEM;
+
+	sensor->dev = dev;
+	sensor->client = client;
+	mutex_init(&sensor->lock);
+
+	sensor->avdd = devm_regulator_get_optional(dev, "avdd");
+	sensor->dvdd = devm_regulator_get_optional(dev, "dvdd");
+	sensor->dovdd = devm_regulator_get_optional(dev, "dovdd");
+	sensor->xclk = devm_clk_get_optional(dev, NULL);
+
+	sensor->reset_gpio = devm_gpiod_get_optional(dev, "reset",
+						     GPIOD_OUT_HIGH);
+	sensor->power0_gpio = devm_gpiod_get_optional(dev, "power0",
+						      GPIOD_OUT_LOW);
+	sensor->power1_gpio = devm_gpiod_get_optional(dev, "power1",
+						      GPIOD_OUT_LOW);
+
+	ret = sc200pc_parse_firmware(sensor);
+	if (ret)
+		return ret;
+
+	v4l2_i2c_subdev_init(&sensor->sd, client, &sc200pc_subdev_ops);
+	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
+	sensor->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
+
+	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
+	if (ret)
+		return ret;
+
+	sensor->fmt.width = SC200PC_WIDTH;
+	sensor->fmt.height = SC200PC_HEIGHT;
+	sensor->fmt.code = MEDIA_BUS_FMT_SBGGR10_1X10;
+	sensor->fmt.field = V4L2_FIELD_NONE;
+	sensor->fmt.colorspace = V4L2_COLORSPACE_RAW;
+
+	sensor->cur_vts = SC200PC_VTS_DEF;
+
+	ret = v4l2_ctrl_handler_init(&sensor->ctrls, 11);
+	if (ret)
+		goto err_entity_cleanup;
+
+	sensor->link_freq = v4l2_ctrl_new_int_menu(&sensor->ctrls, NULL,
+						   V4L2_CID_LINK_FREQ,
+						   ARRAY_SIZE(sc200pc_link_freqs) - 1,
+						   0, sc200pc_link_freqs);
+	if (sensor->link_freq)
+		sensor->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
+	sensor->pixel_rate = v4l2_ctrl_new_std(&sensor->ctrls, &sc200pc_ctrl_ops,
+					       V4L2_CID_PIXEL_RATE,
+					       SC200PC_PIXEL_RATE_DEFAULT,
+					       SC200PC_PIXEL_RATE_DEFAULT,
+					       1, SC200PC_PIXEL_RATE_DEFAULT);
+	if (sensor->pixel_rate)
+		sensor->pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
+	/*
+	 * VBLANK — writable so the HAL can adjust frame duration.
+	 * The HAL computes fll = VBLANK + height, then writes VTS.
+	 */
+	sensor->vblank = v4l2_ctrl_new_std(&sensor->ctrls, &sc200pc_ctrl_ops,
+					   V4L2_CID_VBLANK,
+					   SC200PC_VTS_MIN - SC200PC_HEIGHT,
+					   SC200PC_VTS_MAX - SC200PC_HEIGHT,
+					   1, SC200PC_VBLANK_DEF);
+
+	/*
+	 * HBLANK — writable so SetControl() from the HAL succeeds, but
+	 * the hardware HTS is fixed by the init table (the sensor uses
+	 * internal column-parallel readout, so the real line length in
+	 * internal clocks cannot be changed without re-programming the
+	 * PLL). See the SC200PC_INTERNAL_PARALLELISM comment above.
+	 */
+	sensor->hblank = v4l2_ctrl_new_std(&sensor->ctrls, &sc200pc_ctrl_ops,
+					   V4L2_CID_HBLANK,
+					   SC200PC_HBLANK_DEF,
+					   SC200PC_HBLANK_DEF,
+					   1, SC200PC_HBLANK_DEF);
+
+	sensor->exposure = v4l2_ctrl_new_std(&sensor->ctrls, &sc200pc_ctrl_ops,
+					     V4L2_CID_EXPOSURE,
+					     SC200PC_EXPOSURE_MIN,
+					     SC200PC_EXPOSURE_MAX,
+					     1, SC200PC_EXPOSURE_DEFAULT);
+
+	/*
+	 * Expose analogue_gain as total requested gain. The real hardware analogue
+	 * stage still tops out at SC200PC_ANALOGUE_GAIN_MAX; values above that are
+	 * automatically spilled into digital gain by sc200pc_set_total_gain().
+	 */
+	sensor->analogue_gain = v4l2_ctrl_new_std(&sensor->ctrls, &sc200pc_ctrl_ops,
+						  V4L2_CID_ANALOGUE_GAIN,
+						  SC200PC_ANALOGUE_GAIN_MIN,
+						  SC200PC_TOTAL_GAIN_MAX,
+						  1, SC200PC_ANALOGUE_GAIN_DEFAULT);
+
+	/* Separate manual digital-gain control kept for diagnostics/experiments. */
+	sensor->digital_gain = v4l2_ctrl_new_std(&sensor->ctrls, &sc200pc_ctrl_ops,
+						 V4L2_CID_DIGITAL_GAIN,
+						 SC200PC_DIGITAL_GAIN_MIN,
+						 SC200PC_DIGITAL_GAIN_MAX,
+						 1, SC200PC_DIGITAL_GAIN_DEFAULT);
+
+	sc200pc_update_exposure_range(sensor);
+
+	sensor->test_pattern =
+		v4l2_ctrl_new_std_menu_items(&sensor->ctrls, &sc200pc_ctrl_ops,
+					     V4L2_CID_TEST_PATTERN,
+					     ARRAY_SIZE(sc200pc_test_pattern_menu) - 1,
+					     0, 0, sc200pc_test_pattern_menu);
+
+	/*
+	 * Register V4L2_CID_CAMERA_ORIENTATION and
+	 * V4L2_CID_CAMERA_SENSOR_ROTATION from firmware-node properties.
+	 * libcamera and WirePlumber's libcamera SPA source require these;
+	 * without them WirePlumber aborts during camera enumeration.
+	 *
+	 * The ACPI SSDB on Panther Lake does not always advertise these
+	 * properties — treat a parse miss as "defaults" rather than fatal.
+	 */
+	{
+		struct v4l2_fwnode_device_properties props;
+
+		/*
+		 * Sets orientation/rotation to V4L2_FWNODE_PROPERTY_UNSET if
+		 * the fwnode lacks them; returns 0 in that case. Only fails
+		 * if the property value is invalid.
+		 */
+		ret = v4l2_fwnode_device_parse(dev, &props);
+		if (ret) {
+			dev_warn(dev, "fwnode device parse failed (%d); skipping orientation/rotation ctrls\n",
+				 ret);
+		} else {
+			if (props.orientation == V4L2_FWNODE_PROPERTY_UNSET)
+				props.orientation = V4L2_FWNODE_ORIENTATION_FRONT;
+			if (props.rotation == V4L2_FWNODE_PROPERTY_UNSET)
+				props.rotation = 0;
+
+			ret = v4l2_ctrl_new_fwnode_properties(&sensor->ctrls,
+							      &sc200pc_ctrl_ops,
+							      &props);
+			if (ret) {
+				dev_err(dev, "failed to register fwnode ctrls: %d\n",
+					ret);
+				goto err_ctrls_free;
+			}
+		}
+	}
+
+	if (sensor->ctrls.error) {
+		ret = sensor->ctrls.error;
+		dev_err(dev, "failed to create v4l2 controls: %d\n", ret);
+		goto err_ctrls_free;
+	}
+
+	sensor->sd.ctrl_handler = &sensor->ctrls;
+
+	ret = sc200pc_power_on(sensor);
+	if (ret)
+		goto err_ctrls_free;
+
+	ret = sc200pc_identify(sensor);
+	sc200pc_power_off(sensor);
+	if (ret)
+		goto err_ctrls_free;
+
+	ret = v4l2_async_register_subdev_sensor(&sensor->sd);
+	if (ret) {
+		dev_err(dev, "failed to register async sensor subdev: %d\n", ret);
+		goto err_ctrls_free;
+	}
+
+	i2c_set_clientdata(client, sensor);
+	dev_info(dev,
+		 "SC200PC bound at 0x%02x, chip 0x%04x rev 0x%02x, lanes=%u, link_freq=%llu\n",
+		 client->addr, sensor->chip_id, sensor->chip_rev,
+		 sensor->mipi_lanes, sc200pc_link_freqs[0]);
+	return 0;
+
+err_ctrls_free:
+	v4l2_ctrl_handler_free(&sensor->ctrls);
+err_entity_cleanup:
+	media_entity_cleanup(&sensor->sd.entity);
+	return ret;
+}
+
+static void sc200pc_remove(struct i2c_client *client)
+{
+	struct sc200pc *sensor = i2c_get_clientdata(client);
+
+	v4l2_async_unregister_subdev(&sensor->sd);
+	v4l2_ctrl_handler_free(&sensor->ctrls);
+	media_entity_cleanup(&sensor->sd.entity);
+}
+
+static const struct acpi_device_id sc200pc_acpi_ids[] = {
+	{ "SSLC2000" },
+	{ }
+};
+MODULE_DEVICE_TABLE(acpi, sc200pc_acpi_ids);
+
+static struct i2c_driver sc200pc_i2c_driver = {
+	.driver = {
+		.name = SC200PC_DRV_NAME,
+		.acpi_match_table = sc200pc_acpi_ids,
+	},
+	.probe = sc200pc_probe,
+	.remove = sc200pc_remove,
+};
+
+module_i2c_driver(sc200pc_i2c_driver);
+
+MODULE_DESCRIPTION("V4L2 driver for Samsung/SmartSens SC200PC (ACPI SSLC2000)");
+MODULE_AUTHOR("James Abbott");
+MODULE_AUTHOR("Marco Glauser");
+MODULE_LICENSE("GPL");
