@@ -1,0 +1,3 @@
+# The IPU7 PSYS node is root-only by default; let the video group use the
+# hardware ISP, as it can the other camera nodes.
+KERNEL=="ipu7-psys[0-9]*", GROUP="video", MODE="0660"

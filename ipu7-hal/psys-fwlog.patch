@@ -1,0 +1,63 @@
+diff --git a/drivers/media/pci/intel/ipu7/psys/ipu-psys.c b/drivers/media/pci/intel/ipu7/psys/ipu-psys.c
+index ce16e4c..ae7a849 100644
+--- a/drivers/media/pci/intel/ipu7/psys/ipu-psys.c
++++ b/drivers/media/pci/intel/ipu7/psys/ipu-psys.c
+@@ -1073,6 +1073,11 @@ static unsigned int ipu7_psys_poll(struct file *file,
+ 
+ 	poll_wait(file, &fh->wait, wait);
+ 
++#ifdef ENABLE_FW_OFFLINE_LOGGER
++	/* Collect firmware log messages even when the firmware raises no event. */
++	ipu7_fw_psys_get_log(fh->psys);
++#endif
++
+ 	mutex_lock(&ip->event_mutex);
+ 	if (!list_empty(&ip->ack_list))
+ 		res = POLLIN;
+diff --git a/drivers/media/pci/intel/ipu7/psys/ipu7-fw-psys.c b/drivers/media/pci/intel/ipu7/psys/ipu7-fw-psys.c
+index 15ba548..241e53b 100644
+--- a/drivers/media/pci/intel/ipu7/psys/ipu7-fw-psys.c
++++ b/drivers/media/pci/intel/ipu7/psys/ipu7-fw-psys.c
+@@ -92,6 +92,16 @@ int ipu7_fw_psys_init(struct ipu7_psys *psys)
+ 	psys->subsys_config = psys_config;
+ 	psys->subsys_config_dma_addr = psys_config_dma_addr;
+ 	memset(psys_config, 0, sizeof(struct ipu7_psys_config));
++#ifdef ENABLE_FW_OFFLINE_LOGGER
++	/* Route firmware log messages to the syscom log queue. */
++	psys_config->logger_config.use_source_severity = 1;
++	memset(psys_config->logger_config.source_severity,
++	       IA_GOFO_FWLOG_SEVERITY_INFO,
++	       sizeof(psys_config->logger_config.source_severity));
++	psys_config->logger_config.use_channels_enable_bitmask = 1;
++	psys_config->logger_config.channels_enable_bitmask =
++		LOGGER_CONFIG_CHANNEL_ENABLE_SYSCOM_BITMASK;
++#endif
+ 	ret = ipu_buttress_get_psys_freq(adev->isp, &freq);
+ 	if (ret) {
+ 		dev_err(dev, "Failed to get PSYS frequency.\n");
+@@ -544,7 +554,25 @@ int ipu7_fw_psys_event_handle(struct ipu7_psys *psys, u8 *buf_ptr)
+ 	return 0;
+ }
+ 
++/*
++ * The log queue is drained from both the event path and poll(), so serialize
++ * the two consumers of its read index.
++ */
++static DEFINE_MUTEX(psys_log_drain_lock);
++
++static int __ipu7_fw_psys_get_log(struct ipu7_psys *psys);
++
+ int ipu7_fw_psys_get_log(struct ipu7_psys *psys)
++{
++	int ret;
++
++	mutex_lock(&psys_log_drain_lock);
++	ret = __ipu7_fw_psys_get_log(psys);
++	mutex_unlock(&psys_log_drain_lock);
++	return ret;
++}
++
++static int __ipu7_fw_psys_get_log(struct ipu7_psys *psys)
+ {
+ 	void *token;
+ 	struct ia_gofo_msg_log *log_msg;

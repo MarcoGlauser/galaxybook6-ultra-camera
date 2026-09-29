@@ -1,0 +1,121 @@
+diff --git a/src/core/IpuPacAdaptor.cpp b/src/core/IpuPacAdaptor.cpp
+index a8aad3f..be252e8 100644
+--- a/src/core/IpuPacAdaptor.cpp
++++ b/src/core/IpuPacAdaptor.cpp
+@@ -347,6 +347,10 @@ status_t IpuPacAdaptor::runAIC(const IspSettings* ispSettings,
+     cca::cca_pal_input_params* inputParams = mStreamIdToInputParams[streamId];
+     inputParams->seq_id = settingSequence;
+     inputParams->stream_id = streamId;
++    // Mandatory per IntelCCATypes.h (microseconds); left at 0 upstream.
++    inputParams->timestamp = aiqResults->mTimestamp != 0
++                                 ? aiqResults->mTimestamp
++                                 : static_cast<uint64_t>(CameraUtils::systemTime() / 1000);
+ 
+     bool useLinearGamma = false;
+     applyMediaFormat(aiqResults, &inputParams->media_format, &useLinearGamma, settingSequence);
+diff --git a/src/core/processingUnit/PipeManager.cpp b/src/core/processingUnit/PipeManager.cpp
+index 5307f1f..534f343 100644
+--- a/src/core/processingUnit/PipeManager.cpp
++++ b/src/core/processingUnit/PipeManager.cpp
+@@ -200,6 +200,36 @@ int PipeManager::bindExternalPorts(
+                     frameInfo++;
+                 }
+             }
++#ifdef DOL_FEATURE
++            /*
++             * A DOL graph has a second (long exposure) raw input. With a linear
++             * sensor there is only one raw frame, so feed that same frame to it.
++             */
++            for (auto& frame : mInputFrameInfo) {
++                if (bind) break;
++                if (!isSameStreamConfig(portInfo.second, frame.second, false)) continue;
++                PortMapping portMap;
++                portMap.mPipeStage = pipeLine.second->getInput();
++                portMap.mExternalPort = frame.first;
++                portMap.mStagePort = portInfo.first;
++                portMap.mStreamId = streamId;
++                mInputMaps.push_back(portMap);
++                LOG1("%s, reuse external sourcePort %x for sinkPort %x", __func__, frame.first,
++                     portInfo.first);
++                // Give that port its own buffers; the frame is copied in per task.
++                auto& ring = mDolCopyBuffers[portInfo.first];
++                ring.clear();
++                const stream_t& s = frame.second;
++                const int size = CameraUtils::getFrameSize(s.format, s.width, s.height);
++                for (int i = 0; i < 8; i++) {
++                    ring.push_back(CameraBuffer::create(V4L2_MEMORY_USERPTR, size, i, s.format,
++                                                        s.width, s.height));
++                    CheckAndLogError(ring.back() == nullptr, NO_MEMORY,
++                                     "failed to allocate DOL copy buffer");
++                }
++                bind = true;
++            }
++#endif
+             CheckAndLogError(!bind, UNKNOWN_ERROR, "@%s, failed to bind input port %x", __func__,
+                              portInfo.first);
+         }
+@@ -343,6 +373,12 @@ bool PipeManager::isSameStreamConfig(const stream_t& internal, const stream_t& e
+         ((external.format == V4L2_PIX_FMT_SRGGB10) || (external.format == V4L2_PIX_FMT_SRGGB12))) {
+         return true;
+     }
++    // Same for BGGR: the graph's input crop starts one row down, which yields GRBG.
++    if (((internal.format == V4L2_PIX_FMT_SGRBG10) || (internal.format == V4L2_PIX_FMT_SGRBG12)) &&
++        ((external.format == V4L2_PIX_FMT_SBGGR10) || (external.format == V4L2_PIX_FMT_SBGGR12)) &&
++        (internal.width == external.width) && (internal.height == external.height)) {
++        return true;
++    }
+ 
+     const bool sameHeight =
+         (internal.height == external.height) || (internal.height == ALIGN_32(external.height));
+@@ -632,6 +668,19 @@ void PipeManager::queueBuffers(const PipeTaskData& task, const std::vector<PortM
+ 
+                 LOG2("<seq%ld>queue input buffer for stream:%d stage uuid: %u, external:%d",
+                      sequence, inputMap.mStreamId, inputMap.mStagePort, inputFrame.first);
++#ifdef DOL_FEATURE
++                auto copies = mDolCopyBuffers.find(inputMap.mStagePort);
++                if (copies != mDolCopyBuffers.end()) {
++                    const auto& src = inputFrame.second;
++                    auto& dst = copies->second[static_cast<size_t>(sequence) % copies->second.size()];
++                    const uint32_t len = std::min(src->getBufferSize(), dst->getBufferSize());
++                    MEMCPY_S(dst->getBufferAddr(), dst->getBufferSize(), src->getBufferAddr(), len);
++                    dst->setSequence(src->getSequence());
++                    dst->setTimestamp(src->getTimestamp());
++                    inputMap.mPipeStage->onBufferAvailable(inputMap.mStagePort, dst);
++                    continue;
++                }
++#endif
+                 inputMap.mPipeStage->onBufferAvailable(inputMap.mStagePort, inputFrame.second);
+             }
+         }
+diff --git a/src/core/processingUnit/PipeManager.h b/src/core/processingUnit/PipeManager.h
+index 60fdb54..43c3533 100644
+--- a/src/core/processingUnit/PipeManager.h
++++ b/src/core/processingUnit/PipeManager.h
+@@ -96,6 +96,12 @@ class PipeManager : public IPipeManager {
+     std::vector<PortMapping> mInputMaps;
+     std::vector<PortMapping> mOutputMaps;
+ 
++#ifdef DOL_FEATURE
++    // Stage input ports fed from an already-bound frame (DOL long input with a
++    // linear sensor), each with its own ring of buffers holding a copy.
++    std::map<uuid, std::vector<std::shared_ptr<CameraBuffer>>> mDolCopyBuffers;
++#endif
++
+     // pair of streamid and pipeLine for YUV reprocessing
+     std::map<int32_t, std::shared_ptr<PipeLine>> mYuvPipeLine;
+     std::vector<PortMapping> mYuvInputMaps;
+diff --git a/src/platformdata/gc/GraphConfig.cpp b/src/platformdata/gc/GraphConfig.cpp
+index 423fb63..d39ae89 100644
+--- a/src/platformdata/gc/GraphConfig.cpp
++++ b/src/platformdata/gc/GraphConfig.cpp
+@@ -82,6 +82,10 @@ void GraphConfig::releaseGraphNodes() {
+ 
+ uint32_t GraphConfig::createQueryKeyAttribute(int cameraId) {
+     uint32_t attributes = 0U;
++#ifdef DOL_FEATURE
++    // Graph settings generated for DOL pipelines key every setting with Dol2Inputs.
++    attributes |= static_cast<uint32_t>(GraphConfigurationKeyAttributes::Dol2Inputs);
++#endif
+     return attributes;
+ }
+ 

@@ -1,0 +1,9 @@
+# Files copied from the Windows driver package. Samsung/Intel property;
+# never commit them.
+win/
+
+# Third-party checkouts and build output for the Intel IPU7 camera stack.
+ipu7-hal/work/
+
+__pycache__/
+.idea/

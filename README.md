@@ -1,37 +1,61 @@
-# Galaxy Book6 Ultra camera on Linux
+# Galaxy Book6 Ultra webcam driver for Linux
 
-Front camera enablement for the Samsung Galaxy Book6 Ultra (PAMC, SKU
-`PAMC-960UJH-PTLH-0`, Panther Lake). The sensor is a Samsung/SmartSens SC200PC
-declared in ACPI as `SSLC2000`, wired to the Intel IPU7.
+Makes the built-in front camera of the **Samsung Galaxy Book6 Ultra** work on
+Linux. After installing, the camera shows up as an ordinary webcam called
+**Virtual Camera** in Google Meet, Zoom, Teams in the browser, and other video
+apps.
 
-Tested on Ubuntu 26.04 LTS, kernel 7.0.0-29-generic, libcamera 0.7.0.
+Tested on Ubuntu 26.04 LTS with kernel 7.0 (`7.0.0-34-generic`), on the
+Galaxy Book6 Ultra (model PAMC, `PAMC-960UJH-PTLH-0`).
 
-## What is missing without this
+## What it does
 
-The kernel already has everything except the sensor:
+- Installs a Linux driver for the camera sensor (an SC200PC), which Linux
+  does not support on its own.
+- Processes the picture on the laptop's built-in image processor (the Intel
+  IPU7), using Intel's camera software and the picture tuning from Samsung's
+  Windows driver. This gives automatic exposure, white balance and noise
+  reduction, and uses little CPU.
+- Delivers 1280×720 video at 30 fps, slowing to 24 fps in dim light to get a
+  brighter picture.
+- Keeps the camera off until an app uses it, and turns it off again when the
+  last app stops.
 
-- `intel-ipu7` binds, loads `ipu7ptl_fw.bin` and authenticates it
-- `ipu_bridge`, `int3472` and the 32 ISYS capture nodes are all present
-- the sensor's I2C client is enumerated at `i2c-3` address `0x36`
+## What is missing
 
-Two pieces are absent, and both are needed:
+- **Other laptops.** It is only tested on the Galaxy Book6 Ultra. Other
+  laptops with the same camera may need changes.
+- **Full HD.** Video is 1280×720 only.
+- **Match Windows in low light.** The picture is grainier than on Windows,
+  especially in a dim room.
+- **Windows Hello face login, background blur, or other Windows camera
+  effects.**
+- **Use its own camera name.** The camera is listed as "Virtual Camera".
+  Apps see a stand-in device that carries the picture; the real capture
+  devices only deliver raw sensor data.
+- **Survive every kernel update.** It is built for Linux 7.0. A newer kernel
+  may need an updated version of this repository (see
+  [Kernel updates](#kernel-updates)).
+- **Uninstall itself.** There is no uninstall script yet.
 
-1. **No V4L2 driver claims `SSLC2000`.** Nothing in the kernel matches
-   `acpi:SSLC2000:SSLC2000:`, so the I2C client sits unbound.
-2. **`ipu_bridge` has no `SSLC2000` entry**, so it builds no software-node
-   graph and `intel-ipu7` logs `no subdev found in graph`.
+## Requirements
 
-Note this machine has no vision-sensing controller in its ACPI tables, so
-unlike the Dell XPS and ThinkPad X1 Carbon Panther Lake laptops, `intel_cvs`
-is not required here.
+- Ubuntu 26.04 on a Galaxy Book6 Ultra
+- Secure Boot with a Machine Owner Key enrolled (step 1 below), or Secure Boot
+  turned off
+- An internet connection: the installer downloads Intel's camera software
+  and Samsung's Windows camera driver, and builds for a few minutes
+- Ubuntu's `universe` repository, which is enabled by default; the installer
+  adds every package it needs from there and from `main`
 
 ## Install
 
-Secure Boot must be able to trust the modules, so enroll a key first:
+### 1. Enroll a signing key (Skip if secure boot is disabled)
+
+Secure Boot must be able to trust the modules DKMS builds:
 
 ```bash
-sudo apt install build-essential dkms v4l-utils \
-    libcamera-tools libcamera-ipa pipewire-libcamera gstreamer1.0-libcamera
+sudo apt install dkms
 sudo dkms generate_mok
 sudo mokutil --import /var/lib/shim-signed/mok/MOK.der   # sets a one-time password
 sudo reboot
@@ -39,30 +63,115 @@ sudo reboot
 
 At boot, MOK Manager appears: **Enroll MOK → Continue → Yes**, then the
 password. Skipping that screen discards the request. Confirm with
-`mokutil --test-key /var/lib/shim-signed/mok/MOK.der`, then:
+`mokutil --test-key /var/lib/shim-signed/mok/MOK.der`.
+
+### 2. Install
 
 ```bash
 sudo ./install.sh
 sudo reboot
-cam -l
 ```
 
-### One more step, easy to miss
+The installer adds the packages it needs, builds the sensor driver and the
+`ipu_bridge` override through DKMS, builds Intel's camera HAL and
+`icamerasrc` (as your user, under `ipu7-hal/work/`, a few minutes; it
+downloads Intel's sources from GitHub), installs the result to
+`/opt/ipu7-camera`, and sets up the relay. After the reboot, pick
+**Virtual Camera** in the browser or in Zoom.
 
-Add yourself to the `video` group:
+Running it again over an earlier installation of this repository replaces
+that installation.
+
+### The Windows driver files
+
+The ISP configuration is built from two files of Samsung's Windows camera
+driver, `graph_settings_SC200PC_KAFC917_PTL.bin` and
+`SC200PC_KAFC917_PTL.aiqb` (`sc200pc.inf`, DriverVer 71.26100.0.11). They
+cannot be distributed here, so the installer gets them itself, from the first
+of:
+
+1. `win/` in this repository, from an earlier run
+2. a mounted Windows partition:
+   `Windows/System32/DriverStore/FileRepository/sc200pc.inf_amd64_*`
+3. the camera driver on Samsung's
+   [download center](https://www.samsung.com/global/galaxybooks-downloadcenter/),
+   `BASW-A4296A0R_1063.ZIP` (Intel camera driver 71.26100.23.20550, which
+   carries the SC200PC files at 71.26100.0.11), downloaded automatically
+
+To use a copy you already have, pass it with `--windows-driver`: that zip,
+the driver's `.cab` from the Microsoft Update Catalog (search for
+`SSLC2000`), a directory it was unpacked to, or a download URL.
 
 ```bash
-sudo usermod -aG video "$USER"
+sudo ./install.sh --windows-driver ~/Downloads/BASW-A4296A0R_1063.ZIP
 ```
 
-WirePlumber enumerates cameras once at startup, and logind applies its device
-ACL slightly later. Without group membership WirePlumber loses that race, fails
-to open `/dev/media0`, and the camera is simply absent from PipeWire until you
-restart WirePlumber by hand.
+The files are checked against known checksums and copied to `win/`, which git
+ignores. A different driver version is refused, since the conversion has only
+been checked against this one.
 
-## What this driver corrects
+## Use
 
-Two bugs were reported against the Pro driver by DC Ippolito on Ultra hardware
+Pick **Virtual Camera** as the camera in the app's video settings. In the
+browser, allow the site to use the camera when asked.
+
+If the camera is missing, check the service that feeds it:
+
+```bash
+systemctl status v4l2-relayd@sc200pc
+```
+
+## How it works
+
+Out of the box, Ubuntu already loads the IPU7 driver and its firmware, and it
+ships Intel's image-processing kernel module (`linux-modules-ipu7-generic`).
+Three pieces are missing, and this repository supplies them:
+
+1. **A sensor driver.** No kernel driver claims the ACPI device `SSLC2000`,
+   so the sensor sits unused. `dkms/sc200pc-0.9.0` is that driver.
+2. **An `ipu_bridge` entry.** Without one, the IPU7 driver never connects to
+   the sensor (`no subdev found in graph`). `dkms/ipu-bridge-sslc2000-*` is
+   the in-tree `ipu-bridge.c` with the entry added.
+3. **An image-processing configuration.** Intel's Linux camera software only
+   ships settings for sensors of laptops sold with Linux. `ipu7-hal/` builds
+   one from Samsung's Windows files.
+
+The picture flows like this:
+
+```
+SC200PC ─CSI─▶ IPU7 ISYS ─▶ Intel camera HAL (PSYS, 3A) ─▶ icamerasrc
+                         ─▶ v4l2-relayd ─▶ v4l2loopback "Virtual Camera"
+                         ─▶ browsers via PipeWire, Zoom directly
+```
+
+- **Intel camera HAL** `intel/ipu7-camera-hal` at `e5172cc` (the PTL release
+  of 2025-12-10), with the matching `ipu7-camera-bins` and `icamerasrc`,
+  built by `ipu7-hal/build.sh`. Their versions are pinned: the converted
+  graph settings depend on that release's data layout.
+- **v4l2-relayd** runs the HAL only while an application is streaming from
+  the loopback device, and closes the camera when the last one stops. The
+  WirePlumber rule `51-ipu7-isp.conf` keeps browsers from also seeing the
+  raw sensor as a second camera.
+- **Graph settings.** The Windows file uses Intel's static-graph format with
+  a Windows-only structure version, a two-exposure (DOL) graph, and a packed
+  ISYS input layout. `ipu7-hal/` stamps it with the Linux release's hashes,
+  rebuilds it as Linux graph 100002, and switches the input feeder to the
+  unpacked 16-bit lines the in-tree ISYS delivers. That last mismatch made
+  the PSYS firmware accept tasks and silently never complete them.
+- **Tuning.** The Windows `.aiqb` loads as is, except that one LAIQ record
+  (`0x108`) is a newer version than the Linux AIC understands; it and two
+  related records are taken from Intel's Linux OV08X40 tuning, which halves
+  the colour noise. The AE exposure plan is stretched so AE uses the whole
+  frame before raising gain. `icamerasrc` gets an `fps-range` property so AE
+  may stretch the frame down to 24 fps; analogue gain is capped at 11x.
+
+`ipu7-hal/` holds these tools and patches, plus the test scripts used to
+develop them (`run.sh`, `control-test.sh`, `noise-measure.py` and others).
+
+## Sensor driver notes
+
+The sensor driver started as the Galaxy Book6 Pro driver by James Abbott (see
+Credits). Two bugs were reported against the Pro driver by DC Ippolito on Ultra hardware
 (`Jabbslad/sc200pc-linux` issue 1). Both are fixed here, and both were then
 confirmed independently against the OEM Windows driver `sc200pc.sys`
 v71.26100.0.11:
@@ -89,69 +198,25 @@ A gain sweep against raw frames confirms the result is linear across the whole
 1×–30.5× control range, matching a pedestal of 64 to within ~1.5 LSB at every
 step.
 
-## Tuning
+Further changes, also matched against the Windows driver:
 
-`tuning/sc200pc.yaml` is for libcamera's simple soft-ISP pipeline.
+- **Group hold.** Every exposure, gain and frame-length update is wrapped in
+  `0x3812 = 0x00 … 0x30`, as the Windows driver does, so the values change
+  on the same frame.
+- **Controls before stream-on.** Exposure and gain are programmed while the
+  sensor is still in standby, so the first frames do not go out at the init
+  table's own values.
+- **Automatic frame extension.** When an exposure no longer fits the frame,
+  the driver lengthens it, down to 24 fps (`SC200PC_FPS_MIN`). The Windows
+  driver likewise rewrites the frame length with every exposure update.
 
-`blackLevel: 4096` is the factory pedestal: 64 at 10 bits, which is what
-libcamera wants on a 16-bit scale. Three independent sources agree — a raw
-measurement on this machine, two records in the factory tuning binary, and
-upstream libcamera's own convention for the OV2740.
+## Kernel updates
 
-The colour matrices are the per-illuminant base matrices from Samsung's
-factory tuning file `SC200PC_KAFC917_PTL.aiqb`, at their stated colour
-temperatures. That file also carries 24 hue-sector matrices per illuminant for
-Intel's hue-segmented colour pipeline; those are deliberately not used, since
-libcamera applies one matrix to every hue and averaging them applies every
-sector's saturation boost to all hues at once.
-
-**The green row is forced to identity.** Clipped highlights reach the matrix as
-`(gainR, 1, gainB)` once libcamera folds in the AWB gains, and the factory
-green cross-terms then pull G below the clipped R and B, so blown whites render
-magenta. Identity keeps G at 1.0 there. It costs the factory's green
-correction, which is the right trade for a laptop camera facing a window.
-
-`aiqb/` holds the parser used to extract all of this. It decodes the CPFF
-container, walks the section and record structure, and emits libcamera YAML.
-The tuning binary itself is not included here; it lives in the Windows driver
-package on the machine, under
-`Windows/System32/DriverStore/FileRepository/sc200pc.inf_amd64_*`.
-
-## Known limitations
-
-**Noise.** In ordinary indoor light the AGC pins exposure at 33 ms and gain at
-its ceiling and still asks for more, leaving the raw frame around 38% of full
-scale, which the pipeline then stretches. That is visible as grain. The only
-lever is longer exposure at a lower frame rate; the OEM mode table has a 15 fps
-mode and the driver exposes `vertical_blanking` up to 31679, but libcamera's
-simple AGC drives only exposure and gain, never blanking.
-
-There is no fixing this in tuning. On Windows the IPU7 hardware ISP applies
-temporal noise reduction and neural tone mapping — the `.aiqb` names those
-blocks. That ISP has no open userspace, mainline ships only the ISYS half of
-the IPU7 driver, and Intel's out-of-tree PSYS module defers permanently on
-Panther Lake (`intel/ipu7-drivers` issue 63). libcamera's soft ISP has no
-noise reduction stage at all.
-
-**Two harmless libcamera warnings** persist until `sc200pc` gets a
-`CameraSensorProperties` entry upstream:
-
-```
-No static properties available for 'sc200pc'
-IPASoft: Failed to create camera sensor helper for sc200pc
-```
-
-**Applications opening `/dev/video0` directly** get raw Bayer, since those are
-the IPU7 ISYS transport nodes. Firefox does this unless
-`media.webrtc.camera.allow-pipewire` is set to true in `about:config`. The
-bundled WirePlumber rule hides those nodes from PipeWire but cannot prevent a
-direct open.
-
-**`ipu-bridge-sslc2000` is kernel-version specific.** It carries a copy of
-`ipu-bridge.c` with a two-line `SSLC2000` entry added, and DKMS installs it to
-`/updates` so it overrides the in-tree module. The bundled copy is Linux 7.0's.
-On a kernel where that file changed, re-extract it and re-apply the entry —
-DKMS will otherwise keep building the stale copy without complaint.
+`ipu-bridge-sslc2000` carries a copy of the kernel's `ipu-bridge.c` with a
+two-line `SSLC2000` entry added. DKMS installs it to `/updates` so it
+overrides the in-tree module. The bundled copy is Linux 7.0's. On a kernel
+where that file changed, re-extract it and re-apply the entry; DKMS will
+otherwise keep building the stale copy without complaint.
 
 ## Credits and licence
 
@@ -162,7 +227,9 @@ Galaxy Book6 Pro. This repository is an Ultra-targeted fork.
 The two driver bugs were reported by **DC Ippolito** on Galaxy Book6 Ultra
 hardware, in issue 1 of that repository.
 
-`ipu-bridge.c` is from the Linux kernel, by Dan Scally, GPL-2.0.
+`ipu-bridge.c` is from the Linux kernel, by Dan Scally, GPL-2.0. Intel's camera
+HAL, binaries and `icamerasrc` are fetched from Intel's repositories at build
+time under their own licences; the patches in `ipu7-hal/` apply to them.
 
 Licensed GPL-2.0, consistent with the `MODULE_LICENSE("GPL")` the driver
 declares. The upstream repository carries no `LICENSE` file; if James Abbott

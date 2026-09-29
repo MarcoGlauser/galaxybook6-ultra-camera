@@ -57,6 +57,13 @@
 #define SC200PC_REG_ANALOGUE_GAIN_COARSE	0x3e08
 #define SC200PC_REG_ANALOGUE_GAIN_FINE	0x3e09
 #define SC200PC_REG_BLACK_LEVEL		0x3901
+/*
+ * Group hold, as the OEM Windows driver uses it: 0x00 opens the group, 0x30
+ * launches the buffered writes together on the next frame.
+ */
+#define SC200PC_REG_GROUP_HOLD		0x3812
+#define SC200PC_GROUP_HOLD_START	0x00
+#define SC200PC_GROUP_HOLD_LAUNCH	0x30
 
 /*
  * Sensor returns (0x0b << 8) | 0x71 on reg reads of 0x3107/0x3108.
@@ -111,9 +118,19 @@
 #define SC200PC_VBLANK_DEF		(SC200PC_VTS_DEF - SC200PC_HEIGHT)
 #define SC200PC_PIXEL_RATE_DEFAULT	((u64)SC200PC_LLP * SC200PC_VTS_DEF * SC200PC_FPS)
 
+/*
+ * Automatic frame extension. The exposure control advertises up to a 24 fps
+ * frame, and the driver lengthens VTS whenever a request no longer fits, so
+ * AE can trade frame rate for light without driving VBLANK itself. With AE
+ * raising exposure before gain, dim scenes drop towards 24 fps with 25% more
+ * light per frame, and bright scenes stay at 30 fps.
+ */
+#define SC200PC_FPS_MIN			24
+#define SC200PC_VTS_AUTO_MAX		(SC200PC_VTS_DEF * SC200PC_FPS / SC200PC_FPS_MIN)
+
 #define SC200PC_EXPOSURE_MIN		1
 #define SC200PC_EXPOSURE_MAX_MARGIN	8
-#define SC200PC_EXPOSURE_MAX		(SC200PC_VTS_DEF - SC200PC_EXPOSURE_MAX_MARGIN)
+#define SC200PC_EXPOSURE_MAX		(SC200PC_VTS_AUTO_MAX - SC200PC_EXPOSURE_MAX_MARGIN)
 #define SC200PC_EXPOSURE_DEFAULT	0x08b0
 #define SC200PC_ANALOGUE_GAIN_MIN	0x10
 #define SC200PC_ANALOGUE_GAIN_MAX	0xf8	/* 15.5x = octave 8.0x x fine 1.94x */
@@ -121,8 +138,8 @@
  * The driver advertises V4L2_CID_ANALOGUE_GAIN as a total gain request,
  * not as pure hardware analogue gain. Requests are filled from the analogue
  * stage first; whatever its encoding cannot reach spills into the
- * digital-gain registers. This keeps libcamera's simple AGC working at
- * 30 fps without needing userspace changes to explicitly drive digital gain.
+ * digital-gain registers, so AE reaches the whole range through one
+ * control.
  *
  * Control scale matches the existing SC200PC helper model: gain code / 16.
  *   0x10  = 1.0x total gain   -> analogue 1.0x,  digital 1.0x
@@ -130,6 +147,7 @@
  *   0x1e8 = 30.5x total gain  -> analogue 15.5x, digital 1.97x
  */
 #define SC200PC_TOTAL_GAIN_MAX		0x1e8	/* 30.5x total via analogue+digital */
+/* 1x until AE sets its own. */
 #define SC200PC_ANALOGUE_GAIN_DEFAULT	0x10
 
 /*
@@ -347,7 +365,8 @@ struct sc200pc {
 	struct v4l2_ctrl *digital_gain;
 	struct v4l2_ctrl *test_pattern;
 
-	u16  cur_vts;
+	u16  cur_vts;	/* frame length requested through VBLANK */
+	u16  hw_vts;	/* frame length programmed, possibly auto-extended */
 	bool streaming;
 	u32 xclk_freq;
 	u32 mipi_lanes;
@@ -449,8 +468,9 @@ static int sc200pc_write_array(struct sc200pc *sensor,
 
 static u32 sc200pc_exposure_max(const struct sc200pc *sensor)
 {
-	return max_t(u32, SC200PC_EXPOSURE_MIN,
-		     sensor->cur_vts - SC200PC_EXPOSURE_MAX_MARGIN);
+	u32 vts = max_t(u32, sensor->cur_vts, SC200PC_VTS_AUTO_MAX);
+
+	return vts - SC200PC_EXPOSURE_MAX_MARGIN;
 }
 
 static void sc200pc_update_exposure_range(struct sc200pc *sensor)
@@ -495,7 +515,23 @@ static void sc200pc_log_key_regs(struct sc200pc *sensor, const char *tag)
 	dev_info(sensor->dev, "%s: %s\n", tag, buf);
 }
 
-static int sc200pc_set_exposure(struct sc200pc *sensor, u32 exposure)
+static int sc200pc_set_vts(struct sc200pc *sensor, u16 vts)
+{
+	int ret;
+
+	ret = sc200pc_write_reg(sensor, SC200PC_REG_VTS_H, vts >> 8);
+	if (ret)
+		return ret;
+
+	ret = sc200pc_write_reg(sensor, SC200PC_REG_VTS_L, vts & 0xff);
+	if (ret)
+		return ret;
+
+	sensor->hw_vts = vts;
+	return 0;
+}
+
+static int sc200pc_write_exposure(struct sc200pc *sensor, u32 exposure)
 {
 	int ret;
 
@@ -503,9 +539,6 @@ static int sc200pc_set_exposure(struct sc200pc *sensor, u32 exposure)
 	 * SmartSens SC20x-family sensors encode coarse integration time as a
 	 * 12.4 fixed-point value across 0x3e00..0x3e02.
 	 */
-	exposure = clamp_t(u32, exposure,
-			   SC200PC_EXPOSURE_MIN, sc200pc_exposure_max(sensor));
-
 	ret = sc200pc_write_reg(sensor, SC200PC_REG_EXPOSURE_H,
 			       (exposure >> 12) & 0x0f);
 	if (ret)
@@ -518,6 +551,40 @@ static int sc200pc_set_exposure(struct sc200pc *sensor, u32 exposure)
 
 	return sc200pc_write_reg(sensor, SC200PC_REG_EXPOSURE_L,
 				 (exposure & 0x0f) << 4);
+}
+
+/*
+ * Program exposure together with the frame length it needs: the VBLANK
+ * request, stretched as far as the exposure requires. The frame is lengthened
+ * before a longer exposure lands and shortened after a shorter one, so no
+ * frame ever carries an exposure longer than itself.
+ */
+static int sc200pc_set_exposure(struct sc200pc *sensor, u32 exposure)
+{
+	u32 vts;
+	int ret;
+
+	exposure = clamp_t(u32, exposure,
+			   SC200PC_EXPOSURE_MIN, sc200pc_exposure_max(sensor));
+
+	vts = max_t(u32, sensor->cur_vts,
+		    exposure + SC200PC_EXPOSURE_MAX_MARGIN);
+	vts = min_t(u32, vts, SC200PC_VTS_MAX);
+
+	if (vts > sensor->hw_vts) {
+		ret = sc200pc_set_vts(sensor, vts);
+		if (ret)
+			return ret;
+	}
+
+	ret = sc200pc_write_exposure(sensor, exposure);
+	if (ret)
+		return ret;
+
+	if (vts < sensor->hw_vts)
+		return sc200pc_set_vts(sensor, vts);
+
+	return 0;
 }
 
 /*
@@ -640,22 +707,6 @@ static int sc200pc_apply_controls(struct sc200pc *sensor)
 	return sc200pc_set_total_gain(sensor, sensor->analogue_gain->val);
 }
 
-static int sc200pc_set_vts(struct sc200pc *sensor, u16 vts)
-{
-	int ret;
-
-	ret = sc200pc_write_reg(sensor, SC200PC_REG_VTS_H, vts >> 8);
-	if (ret)
-		return ret;
-
-	ret = sc200pc_write_reg(sensor, SC200PC_REG_VTS_L, vts & 0xff);
-	if (ret)
-		return ret;
-
-	sensor->cur_vts = vts;
-	return 0;
-}
-
 static int sc200pc_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct sc200pc *sensor = ctrl_to_sc200pc(ctrl);
@@ -664,22 +715,30 @@ static int sc200pc_s_ctrl(struct v4l2_ctrl *ctrl)
 	mutex_lock(&sensor->lock);
 
 	/*
+	 * While streaming, hold the register group so a multi-register update
+	 * (frame length with exposure, analogue with digital gain) lands on a
+	 * single frame, as the OEM Windows driver does around every exposure
+	 * update.
+	 */
+	if (sensor->streaming) {
+		ret = sc200pc_write_reg(sensor, SC200PC_REG_GROUP_HOLD,
+					SC200PC_GROUP_HOLD_START);
+		if (ret)
+			goto out_unlock;
+	}
+
+	/*
 	 * VBLANK / HBLANK are cached even while not streaming so that
 	 * the HAL can read back the value it wrote before stream-on.
 	 */
 	switch (ctrl->id) {
-	case V4L2_CID_VBLANK: {
-		u16 vts = ctrl->val + SC200PC_HEIGHT;
-
-		if (sensor->streaming) {
-			ret = sc200pc_set_vts(sensor, vts);
-		} else {
-			sensor->cur_vts = vts;
-		}
-		if (!ret)
-			sc200pc_update_exposure_range(sensor);
+	case V4L2_CID_VBLANK:
+		sensor->cur_vts = ctrl->val + SC200PC_HEIGHT;
+		sc200pc_update_exposure_range(sensor);
+		if (sensor->streaming)
+			ret = sc200pc_set_exposure(sensor,
+						   sensor->exposure->val);
 		break;
-	}
 	case V4L2_CID_HBLANK:
 		/* Accept the write; HTS is fixed by the init table. */
 		ret = 0;
@@ -691,7 +750,7 @@ static int sc200pc_s_ctrl(struct v4l2_ctrl *ctrl)
 	if (!sensor->streaming)
 		goto out_unlock;
 
-	switch (ctrl->id) {
+	switch (ret ? 0 : ctrl->id) {
 	case V4L2_CID_EXPOSURE:
 		ret = sc200pc_set_exposure(sensor, ctrl->val);
 		break;
@@ -713,6 +772,15 @@ static int sc200pc_s_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	default:
 		break;
+	}
+
+	/* Release the group even after an error so later updates still apply. */
+	{
+		int end = sc200pc_write_reg(sensor, SC200PC_REG_GROUP_HOLD,
+					    SC200PC_GROUP_HOLD_LAUNCH);
+
+		if (!ret)
+			ret = end;
 	}
 
 out_unlock:
@@ -847,26 +915,28 @@ static int sc200pc_start_streaming(struct sc200pc *sensor)
 	sc200pc_log_key_regs(sensor, "post-init regs");
 
 	/*
-	 * Apply VTS if the HAL changed VBLANK before stream-on.
-	 * The init table sets VTS to SC200PC_VTS_DEF; only re-write
-	 * if the cached value differs.
+	 * The init table programs SC200PC_VTS_DEF. Exposure programming below
+	 * rewrites VTS if VBLANK or the exposure calls for another length.
 	 */
-	if (sensor->cur_vts != SC200PC_VTS_DEF) {
-		ret = sc200pc_set_vts(sensor, sensor->cur_vts);
-		if (ret)
-			return ret;
-	}
+	sensor->hw_vts = SC200PC_VTS_DEF;
+
+	/*
+	 * Program exposure and gain while still in sleep. The init table carries
+	 * its own exposure (139 lines) and 1x gain; applying the cached controls
+	 * only after stream-on let the first frames go out at those values while
+	 * AE believed its own were in effect.
+	 */
+	ret = sc200pc_apply_controls(sensor);
+	if (ret)
+		return ret;
+
+	sc200pc_log_key_regs(sensor, "post-control regs");
 
 	/* Releasing sleep starts the MIPI output. */
 	ret = sc200pc_write_reg(sensor, SC200PC_REG_SLEEP_MODE, 0x01);
 	if (ret)
 		return ret;
 
-	ret = sc200pc_apply_controls(sensor);
-	if (ret)
-		return ret;
-
-	sc200pc_log_key_regs(sensor, "post-control regs");
 	dev_info(sensor->dev, "streaming started\n");
 	return 0;
 }
@@ -1146,6 +1216,7 @@ static int sc200pc_probe(struct i2c_client *client)
 	sensor->fmt.colorspace = V4L2_COLORSPACE_RAW;
 
 	sensor->cur_vts = SC200PC_VTS_DEF;
+	sensor->hw_vts = SC200PC_VTS_DEF;
 
 	ret = v4l2_ctrl_handler_init(&sensor->ctrls, 11);
 	if (ret)
@@ -1224,8 +1295,8 @@ static int sc200pc_probe(struct i2c_client *client)
 	/*
 	 * Register V4L2_CID_CAMERA_ORIENTATION and
 	 * V4L2_CID_CAMERA_SENSOR_ROTATION from firmware-node properties.
-	 * libcamera and WirePlumber's libcamera SPA source require these;
-	 * without them WirePlumber aborts during camera enumeration.
+	 * Userspace camera stacks expect these; without them WirePlumber
+	 * aborted during camera enumeration.
 	 *
 	 * The ACPI SSDB on Panther Lake does not always advertise these
 	 * properties — treat a parse miss as "defaults" rather than fatal.
