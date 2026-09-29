@@ -167,6 +167,14 @@ SC200PC ─CSI─▶ IPU7 ISYS ─▶ Intel camera HAL (PSYS, 3A) ─▶ icamera
 
 `ipu7-hal/` holds these tools and patches, plus the test scripts used to
 develop them (`run.sh`, `control-test.sh`, `noise-measure.py` and others).
+`get-windows-files.sh` fetches and checks the Windows files, and
+`packages.txt` lists the Ubuntu packages the installer adds.
+
+The GitHub Actions workflow builds all of this on a fresh Ubuntu 26.04 on
+every push and weekly: the kernel modules against Ubuntu's current kernel,
+the Intel camera stack from Samsung's download, and then checks that the
+HAL's own reader accepts every configuration of the converted graph and that
+`icamerasrc` loads with the sensor configuration. It cannot test the camera.
 
 ## Sensor driver notes
 

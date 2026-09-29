@@ -1,0 +1,96 @@
+# Checks that everything install.sh builds still builds on a fresh Ubuntu
+# 26.04: the packages exist, the kernel modules compile against the current
+# kernel, and the Intel camera stack builds and converts Samsung's files into
+# a graph and configuration the HAL accepts. The camera itself cannot be
+# tested here.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  # Weekly, to notice Ubuntu kernel or package updates and a moved Samsung
+  # download.
+  schedule:
+    - cron: "17 4 * * 1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts
+        run: |
+          if ! command -v shellcheck > /dev/null; then
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq shellcheck
+          fi
+          bash -n install.sh get-windows-files.sh ipu7-hal/*.sh
+          shellcheck -S warning install.sh get-windows-files.sh ipu7-hal/*.sh
+      - name: Python scripts
+        run: python3 -m py_compile ipu7-hal/*.py
+
+  build:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          apt-get update
+          grep -v -e '^#' -e '^$' packages.txt |
+              xargs apt-get install -y --no-install-recommends ca-certificates curl linux-headers-generic
+
+      - name: Build the kernel modules
+        run: |
+          kver=$(ls /lib/modules | head -1)
+          echo "Kernel $kver"
+          bridge=dkms/ipu-bridge-sslc2000-${kver%%-*}
+          if [ ! -d "$bridge" ]; then
+              echo "::error::No $bridge for Ubuntu's current kernel $kver"
+              exit 1
+          fi
+          for d in dkms/sc200pc-0.9.0 "$bridge"; do
+              make -C "/lib/modules/$kver/build" M="$PWD/$d" W=1 modules
+          done
+
+      - name: Get the Windows driver files
+        run: ./get-windows-files.sh
+
+      - name: Build the Intel camera stack
+        run: VARIANT=system ipu7-hal/build.sh
+
+      - name: Check the converted graph
+        run: |
+          W=ipu7-hal/work
+          H=$W/hal/modules/ipu_desc/ipu75xa
+          g++ -std=c++17 -w -I"$H" -o "$W/check-graph" ipu7-hal/check-graph.cpp \
+              "$H/Ipu75xaStaticGraphReaderAutogen.cpp" "$H/Ipu75xaStaticGraphAutogen.cpp"
+          "$W/check-graph" "$W/stage/opt/ipu7-camera/etc/camera/ipu75xa/gcss/SC200PC_KAFC917.IPU75XA.bin"
+
+      - name: Check the installed configuration
+        run: |
+          C=ipu7-hal/work/stage/opt/ipu7-camera/etc/camera/ipu75xa
+          python3 - "$C" <<'EOF'
+          import json, re, sys
+          c = sys.argv[1]
+          def load(p):  # jsoncpp accepts // comment lines
+              return json.loads(re.sub(r"(?m)^\s*//.*$", "", open(p).read()))
+          configs = load(f"{c}/libcamhal_configs.json")
+          assert "sc200pc-uf-0" in json.dumps(configs), "sc200pc-uf-0 not registered"
+          load(f"{c}/sensors/sc200pc-uf.json")
+          open(f"{c}/SC200PC_KAFC917_PTL.aiqb", "rb").read()
+          print("configuration ok")
+          EOF
+
+      # Without the camera the HAL finds no sensor, so this only shows that
+      # the plugin and the HAL load, with the fps-range patch applied.
+      - name: Check that icamerasrc loads
+        run: |
+          cp -a ipu7-hal/work/stage/opt/ipu7-camera /opt/ipu7-camera
+          GST_PLUGIN_PATH=/opt/ipu7-camera/lib/gstreamer-1.0 LD_LIBRARY_PATH=/opt/ipu7-camera/lib \
+              gst-inspect-1.0 icamerasrc > inspect.txt
+          grep -q 'fps-range' inspect.txt

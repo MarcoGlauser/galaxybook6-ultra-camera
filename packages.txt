@@ -1,0 +1,37 @@
+# Ubuntu packages install.sh installs, besides the running kernel's headers.
+# CI installs the same list.
+
+# Sensor driver and ipu_bridge (DKMS)
+build-essential
+dkms
+
+# Intel camera HAL (expat, jsoncpp, libdrm) and icamerasrc (GStreamer,
+# libdrm_intel)
+git
+cmake
+automake
+autoconf
+libtool
+pkg-config
+python3
+g++
+libexpat1-dev
+libjsoncpp-dev
+libdrm-dev
+libgstreamer1.0-dev
+libgstreamer-plugins-base1.0-dev
+
+# Ubuntu's signed IPU7 PSYS module and the IPU7 firmware
+linux-modules-ipu7-generic
+linux-firmware-intel-graphics
+
+# The relay into "Virtual Camera": v4l2sink is in plugins-good, and
+# v4l2loopback-dkms is built and signed by DKMS with the same MOK
+gstreamer1.0-plugins-base
+gstreamer1.0-plugins-good
+v4l2-relayd
+v4l2loopback-dkms
+
+# Troubleshooting
+v4l-utils
+gstreamer1.0-tools

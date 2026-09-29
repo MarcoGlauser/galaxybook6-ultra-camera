@@ -7,3 +7,6 @@ ipu7-hal/work/
 
 __pycache__/
 .idea/
+
+# Personal drafts (vendor requests); not part of the project.
+docs/
