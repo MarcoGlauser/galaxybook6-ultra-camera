@@ -10,3 +10,7 @@ __pycache__/
 
 # Personal drafts (vendor requests); not part of the project.
 docs/
+
+# Generated when the DKMS packages are built in place.
+dkms/*/ipu-bridge.c
+dkms/*/hdr/

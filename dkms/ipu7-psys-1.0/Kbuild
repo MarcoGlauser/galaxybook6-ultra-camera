@@ -1,0 +1,3 @@
+obj-m += intel-ipu7-psys.o
+intel-ipu7-psys-y := ipu-psys.o ipu7-psys.o ipu7-fw-psys.o
+ccflags-y += -I$(src)/hdr -I$(src)/include

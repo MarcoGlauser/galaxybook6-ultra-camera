@@ -21,8 +21,8 @@ libdrm-dev
 libgstreamer1.0-dev
 libgstreamer-plugins-base1.0-dev
 
-# Ubuntu's signed IPU7 PSYS module and the IPU7 firmware
-linux-modules-ipu7-generic
+# The IPU7 firmware. (Ubuntu's signed PSYS module, linux-modules-ipu7-generic,
+# is added by install.sh on -generic kernels; other kernels build PSYS by DKMS.)
 linux-firmware-intel-graphics
 
 # The relay into "Virtual Camera": v4l2sink is in plugins-good, and
