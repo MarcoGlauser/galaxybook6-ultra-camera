@@ -16,7 +16,7 @@ Galaxy Book6 Ultra (model PAMC, `PAMC-960UJH-PTLH-0`).
   IPU7), using Intel's camera software and the picture tuning from Samsung's
   Windows driver. This gives automatic exposure, white balance and noise
   reduction, and uses little CPU.
-- Delivers 1280×720 video at 30 fps, slowing to 24 fps in dim light to get a
+- Delivers 1920×1080 video at 30 fps, slowing to 24 fps in dim light to get a
   brighter picture.
 - Keeps the camera off until an app uses it, and turns it off again when the
   last app stops.
@@ -25,7 +25,6 @@ Galaxy Book6 Ultra (model PAMC, `PAMC-960UJH-PTLH-0`).
 
 - **Other laptops.** It is only tested on the Galaxy Book6 Ultra. Other
   laptops with the same camera may need changes.
-- **Full HD.** Video is 1280×720 only.
 - **Match Windows in low light.** The picture is grainier than on Windows,
   especially in a dim room.
 - **Windows Hello face login, background blur, or other Windows camera
