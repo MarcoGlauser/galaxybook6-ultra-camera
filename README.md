@@ -33,9 +33,6 @@ Galaxy Book6 Ultra (model PAMC, `PAMC-960UJH-PTLH-0`).
 - **Use its own camera name.** The camera is listed as "Virtual Camera".
   Apps see a stand-in device that carries the picture; the real capture
   devices only deliver raw sensor data.
-- **Survive every kernel update.** It is built for Linux 7.0. A newer kernel
-  may need an updated version of this repository (see
-  [Kernel updates](#kernel-updates)).
 - **Uninstall itself.** There is no uninstall script yet.
 
 ## Requirements
@@ -220,11 +217,22 @@ Further changes, also matched against the Windows driver:
 
 ## Kernel updates
 
-`ipu-bridge-sslc2000` carries a copy of the kernel's `ipu-bridge.c` with a
-two-line `SSLC2000` entry added. DKMS installs it to `/updates` so it
-overrides the in-tree module. The bundled copy is Linux 7.0's. On a kernel
-where that file changed, re-extract it and re-apply the entry; DKMS will
-otherwise keep building the stale copy without complaint.
+The modules are rebuilt by DKMS for every new kernel, and work on any kernel
+that has the in-tree staging `intel_ipu7` driver (Linux 6.17 or newer), not
+only Ubuntu's.
+
+- `ipu-bridge-sslc2000` fetches the kernel's own `ipu-bridge.c` for the exact
+  kernel version from kernel.org and adds the two-line `SSLC2000` entry.
+  DKMS installs it to `/updates` so it overrides the in-tree module.
+- The hardware ISP needs Intel's PSYS module. Ubuntu's generic kernels ship
+  it (`linux-modules-ipu7-generic`); on other kernels, such as XanMod,
+  `ipu7-psys` builds it from intel/ipu7-drivers against the staging IPU7
+  headers of that kernel, also fetched from kernel.org.
+
+Building for a new kernel therefore needs a network connection.
+
+Tested on Ubuntu 26.04 with its 7.0 kernel (Galaxy Book6 Ultra), and with
+XanMod 7.2.15 and 7.3.6 (Galaxy Book6 Pro).
 
 ## Credits and licence
 
@@ -235,7 +243,9 @@ Galaxy Book6 Pro. This repository is an Ultra-targeted fork.
 The two driver bugs were reported by **DC Ippolito** on Galaxy Book6 Ultra
 hardware, in issue 1 of that repository.
 
-`ipu-bridge.c` is from the Linux kernel, by Dan Scally, GPL-2.0. Intel's camera
+`ipu-bridge.c` is from the Linux kernel, by Dan Scally, GPL-2.0. The PSYS
+driver in `dkms/ipu7-psys-1.0` is Intel's, from
+[intel/ipu7-drivers](https://github.com/intel/ipu7-drivers) (GPL-2.0). Intel's camera
 HAL, binaries and `icamerasrc` are fetched from Intel's repositories at build
 time under their own licences; the patches in `ipu7-hal/` apply to them.
 

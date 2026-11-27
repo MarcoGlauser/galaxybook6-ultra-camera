@@ -48,24 +48,46 @@ fi
 
 # --- Packages ------------------------------------------------------------------
 
+kernel=$(uname -r)
+
 mapfile -t packages < <(grep -v -e '^#' -e '^$' "$HERE/packages.txt")
-apt-get install -y "linux-headers-$(uname -r)" "${packages[@]}"
+# Ubuntu's generic kernels ship a signed PSYS module; other kernels (e.g.
+# XanMod) get one built by DKMS below.
+if [[ $kernel == *-generic ]]; then
+    packages+=(linux-modules-ipu7-generic)
+fi
+apt-get install -y "linux-headers-$kernel" "${packages[@]}"
 
 # --- Sensor driver and ipu_bridge ------------------------------------------------
 
-kernel=$(uname -r)
-bridge_version=${kernel%%-*}
+# ipu-bridge (and PSYS, where needed) fetch the sources matching the kernel
+# from kernel.org when DKMS builds them, so they follow kernel updates.
+dkms_packages=("sc200pc/0.9.0" "ipu-bridge-sslc2000/1.0")
 
-for pkg in "sc200pc/0.9.0" "ipu-bridge-sslc2000/$bridge_version"; do
+# Earlier versions of this installer keyed ipu-bridge-sslc2000 by kernel.
+for old in /usr/src/ipu-bridge-sslc2000-[0-9]*.[0-9]*.[0-9]*; do
+    [[ -d $old ]] || continue
+    dkms remove "ipu-bridge-sslc2000/${old##*-}" --all 2>/dev/null || true
+    rm -rf "$old"
+done
+
+# The kernel must have the staging IPU7 driver; PSYS is built here only if
+# the kernel does not already provide it.
+if ! modinfo -k "$kernel" intel_ipu7 > /dev/null 2>&1; then
+    echo "Kernel $kernel has no intel_ipu7 driver (needs Linux 6.17 or newer)." >&2
+    exit 1
+fi
+if modinfo -k "$kernel" -n intel_ipu7_psys 2> /dev/null | grep -qv '/updates/'; then
+    dkms remove "ipu7-psys/1.0" --all 2>/dev/null || true
+    rm -rf /usr/src/ipu7-psys-1.0
+else
+    dkms_packages+=("ipu7-psys/1.0")
+fi
+
+for pkg in "${dkms_packages[@]}"; do
     name=${pkg%/*}
     version=${pkg#*/}
     source_dir="$HERE/dkms/$name-$version"
-
-    if [[ ! -d $source_dir ]]; then
-        echo "No DKMS sources for $name at $version." >&2
-        echo "The bundled ipu-bridge.c matches one kernel series; see README." >&2
-        exit 1
-    fi
 
     dkms remove "$name/$version" --all 2>/dev/null || true
     rm -rf "/usr/src/$name-$version"
