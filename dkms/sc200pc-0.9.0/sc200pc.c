@@ -712,7 +712,8 @@ static int sc200pc_s_ctrl(struct v4l2_ctrl *ctrl)
 	struct sc200pc *sensor = ctrl_to_sc200pc(ctrl);
 	int ret = 0;
 
-	mutex_lock(&sensor->lock);
+	/* Called with sensor->lock held: it is also the control handler lock. */
+	lockdep_assert_held(&sensor->lock);
 
 	/*
 	 * While streaming, hold the register group so a multi-register update
@@ -784,7 +785,6 @@ static int sc200pc_s_ctrl(struct v4l2_ctrl *ctrl)
 	}
 
 out_unlock:
-	mutex_unlock(&sensor->lock);
 	return ret;
 }
 
@@ -1221,6 +1221,13 @@ static int sc200pc_probe(struct i2c_client *client)
 	ret = v4l2_ctrl_handler_init(&sensor->ctrls, 11);
 	if (ret)
 		goto err_entity_cleanup;
+	/*
+	 * Share one lock between the control handler and the driver: s_ctrl
+	 * runs under it, and __v4l2_ctrl_modify_range() from inside s_ctrl
+	 * may call s_ctrl again for the clamped exposure, which deadlocked
+	 * when s_ctrl took a separate driver mutex.
+	 */
+	sensor->ctrls.lock = &sensor->lock;
 
 	sensor->link_freq = v4l2_ctrl_new_int_menu(&sensor->ctrls, NULL,
 						   V4L2_CID_LINK_FREQ,
